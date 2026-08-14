@@ -165,6 +165,24 @@ class TestArgConverter:
         assert result["n"] == "42"
         assert isinstance(result["n"], str)
 
+    def test_plain_parameter_tags(self):
+        raw = (
+            '\n<parameter name="command" string="true">'
+            "git --version 2>&1</parameter>\n"
+        )
+        result = json.loads(_dsml_arg_converter(raw, partial=False))
+        assert result == {"command": "git --version 2>&1"}
+
+    def test_bare_schema_parameter_tag_is_gated(self):
+        raw = "<query>iden3 go-iden3-crypto poseidon.Hash</query>"
+
+        assert json.loads(_dsml_arg_converter(raw, partial=False)) == {}
+
+        result = json.loads(
+            _dsml_arg_converter(raw, partial=False, simple_param_names={"query"})
+        )
+        assert result == {"query": "iden3 go-iden3-crypto poseidon.Hash"}
+
 
 # ── Bare </think> absorption and duplicate <think> absorption ─────────
 
@@ -217,8 +235,10 @@ class TestMissingInvokeEnd:
         parser = DeepSeekV4Parser(mock_tokenizer)
         chunks = [
             DSML_TOOL_START,
-            f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
-            f"{_param('location', 'true', 'NYC')}\n",
+            (
+                f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
+                f"{_param('location', 'true', 'NYC')}\n"
+            ),
             DSML_TOOL_END,
             "Done.",
         ]
@@ -538,6 +558,115 @@ def _invoke(name, *params):
 
 def _tool_calls(*invokes):
     return DSML_TOOL_START + "\n".join(invokes) + DSML_TOOL_END
+
+
+class TestMalformedDsmlTolerance:
+    def test_plain_tool_calls_with_bare_schema_param(
+        self,
+        mock_tokenizer,
+        mock_request,
+    ):
+        tool = _make_tool("web_search", {"query": {"type": "string"}})
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[tool])
+        mock_request.tools = [tool]
+
+        text = (
+            "\n\n<tool_calls>\n"
+            '<｜DSML｜invoke name="web_search">\n'
+            "<query>iden3 go-iden3-crypto poseidon.Hash v0.0.5 "
+            "signature</query>\n"
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>"
+        )
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name == "web_search"
+        args = json.loads(result.tool_calls[0].function.arguments)
+        assert args == {
+            "query": "iden3 go-iden3-crypto poseidon.Hash v0.0.5 signature"
+        }
+
+    def test_mixed_plain_and_dsml_tool_tags(
+        self,
+        mock_tokenizer,
+        mock_request,
+    ):
+        tool = _make_tool("bash", {"command": {"type": "string"}})
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[tool])
+        mock_request.tools = [tool]
+
+        text = (
+            "\n\n<tool_calls>\n"
+            '<invoke name="bash">\n'
+            '<parameter name="command" string="true">'
+            'python -c "import django; print(django.get_version())" 2>&1'
+            "</parameter>\n"
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>"
+        )
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name == "bash"
+        args = json.loads(result.tool_calls[0].function.arguments)
+        assert args == {
+            "command": 'python -c "import django; print(django.get_version())" 2>&1'
+        }
+
+    def test_plain_tool_tags_streaming_do_not_leak_parameter_close(
+        self,
+        mock_tokenizer,
+        mock_request,
+    ):
+        tool = _make_tool("bash", {"command": {"type": "string"}})
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[tool])
+        mock_request.tools = [tool]
+
+        chunks = [
+            "<tool_calls>",
+            '<invoke name="bash">',
+            '<parameter name="command" string="true">',
+            "git --version 2>&1",
+            "</parameter>",
+            "</invoke>",
+            "</tool_calls>",
+        ]
+
+        results = simulate_tool_streaming(parser, mock_request, chunks)
+
+        assert collect_function_name(results) == "bash"
+        args = json.loads(collect_tool_arguments(results))
+        assert args == {"command": "git --version 2>&1"}
+
+    def test_bare_schema_param_streaming(
+        self,
+        mock_tokenizer,
+        mock_request,
+    ):
+        tool = _make_tool("web_search", {"query": {"type": "string"}})
+        parser = DeepSeekV4Parser(mock_tokenizer, tools=[tool])
+        mock_request.tools = [tool]
+
+        chunks = [
+            "<tool_calls>",
+            '<｜DSML｜invoke name="web_search">',
+            "<query>",
+            "iden3 go-iden3-crypto poseidon.Hash",
+            "</query>",
+            "</｜DSML｜invoke>",
+            "</tool_calls>",
+        ]
+
+        results = simulate_tool_streaming(parser, mock_request, chunks)
+
+        assert collect_function_name(results) == "web_search"
+        args = json.loads(collect_tool_arguments(results))
+        assert args == {"query": "iden3 go-iden3-crypto poseidon.Hash"}
 
 
 class TestParallelUnwrapping:
