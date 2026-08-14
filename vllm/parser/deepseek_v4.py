@@ -44,25 +44,69 @@ DSML_THINK_START = "<think>"
 DSML_THINK_END = "</think>"
 DSML_TOOL_START = f"<{_DSML}tool_calls>"
 DSML_TOOL_END = f"</{_DSML}tool_calls>"
+DSML_TOOL_START_PLAIN = "<tool_calls>"
+DSML_TOOL_END_PLAIN = "</tool_calls>"
 DSML_INVOKE_PREFIX = f'<{_DSML}invoke name="'
+DSML_INVOKE_PREFIX_PLAIN = '<invoke name="'
 DSML_INVOKE_NAME_END = '">'
 DSML_INVOKE_END = f"</{_DSML}invoke>"
+DSML_INVOKE_END_PLAIN = "</invoke>"
 DSML_PARAM_CLOSE = f"</{_DSML}parameter>"
+DSML_PARAM_CLOSE_PLAIN = "</parameter>"
 
 _ESCAPED_DSML = re.escape(_DSML)
 _PARAM_RE = re.compile(
-    rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
-    rf"(.*?)</{_ESCAPED_DSML}parameter>",
+    rf'<(?:{_ESCAPED_DSML})?parameter\s+name="([^"]+)"\s+'
+    rf'string="(true|false)">'
+    rf"(.*?)</(?:{_ESCAPED_DSML})?parameter>",
     re.DOTALL,
 )
 _PARTIAL_PARAM_RE = re.compile(
-    rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
+    rf'<(?:{_ESCAPED_DSML})?parameter\s+name="([^"]+)"\s+'
+    rf'string="(true|false)">'
     rf"(.*)$",
+    re.DOTALL,
+)
+_SIMPLE_PARAM_RE = re.compile(
+    r"<([A-Za-z_][\w.-]*)>(.*?)</\1>",
+    re.DOTALL,
+)
+_PARTIAL_SIMPLE_PARAM_RE = re.compile(
+    r"<([A-Za-z_][\w.-]*)>(.*)$",
     re.DOTALL,
 )
 
 
-def _dsml_arg_converter(raw_args: str, partial: bool) -> str:
+def _maybe_add_simple_params(
+    params: dict[str, object],
+    raw_args: str,
+    partial: bool,
+    allowed_names: set[str] | None,
+) -> None:
+    """Tolerate bare ``<arg>value</arg>`` tags for known tool parameters."""
+    if not allowed_names:
+        return
+
+    last_end = 0
+    for m in _SIMPLE_PARAM_RE.finditer(raw_args):
+        name, value = m.group(1), m.group(2)
+        if name in allowed_names and name not in params:
+            params[name] = value
+        last_end = m.end()
+
+    if partial:
+        pm = _PARTIAL_SIMPLE_PARAM_RE.search(raw_args, last_end)
+        if pm:
+            name, value = pm.group(1), pm.group(2)
+            if name in allowed_names and name not in params:
+                params[name] = value
+
+
+def _dsml_arg_converter(
+    raw_args: str,
+    partial: bool,
+    simple_param_names: set[str] | None = None,
+) -> str:
     params: dict[str, object] = {}
 
     last_end = 0
@@ -86,6 +130,8 @@ def _dsml_arg_converter(raw_args: str, partial: bool) -> str:
             else:
                 with contextlib.suppress(json.JSONDecodeError, ValueError):
                     params[name] = json.loads(value)
+
+    _maybe_add_simple_params(params, raw_args, partial, simple_param_names)
 
     return json.dumps(params, ensure_ascii=False)
 
@@ -131,10 +177,15 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
             "THINK_END": DSML_THINK_END,
             "TOOL_START": DSML_TOOL_START,
             "TOOL_END": DSML_TOOL_END,
+            "TOOL_START_PLAIN": DSML_TOOL_START_PLAIN,
+            "TOOL_END_PLAIN": DSML_TOOL_END_PLAIN,
             "INVOKE_PREFIX": DSML_INVOKE_PREFIX,
+            "INVOKE_PREFIX_PLAIN": DSML_INVOKE_PREFIX_PLAIN,
             "INVOKE_NAME_END": DSML_INVOKE_NAME_END,
             "INVOKE_END": DSML_INVOKE_END,
+            "INVOKE_END_PLAIN": DSML_INVOKE_END_PLAIN,
             "PARAM_CLOSE": DSML_PARAM_CLOSE,
+            "PARAM_CLOSE_PLAIN": DSML_PARAM_CLOSE_PLAIN,
         },
         token_id_terminals={
             "THINK_START": DSML_THINK_START,
@@ -166,11 +217,23 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
                 ParserState.TOOL_PREAMBLE,
                 (EventType.REASONING_END,),
             ),
+            (ParserState.REASONING, "TOOL_START_PLAIN"): Transition(
+                ParserState.TOOL_PREAMBLE,
+                (EventType.REASONING_END,),
+            ),
             (ParserState.CONTENT, "TOOL_START"): Transition(
                 ParserState.TOOL_PREAMBLE,
                 (),
             ),
+            (ParserState.CONTENT, "TOOL_START_PLAIN"): Transition(
+                ParserState.TOOL_PREAMBLE,
+                (),
+            ),
             (ParserState.TOOL_PREAMBLE, "INVOKE_PREFIX"): Transition(
+                ParserState.TOOL_NAME,
+                (EventType.TOOL_CALL_START,),
+            ),
+            (ParserState.TOOL_PREAMBLE, "INVOKE_PREFIX_PLAIN"): Transition(
                 ParserState.TOOL_NAME,
                 (EventType.TOOL_CALL_START,),
             ),
@@ -182,7 +245,15 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
                 ParserState.TOOL_BETWEEN,
                 (EventType.TOOL_CALL_END,),
             ),
+            (ParserState.TOOL_ARGS, "INVOKE_END_PLAIN"): Transition(
+                ParserState.TOOL_BETWEEN,
+                (EventType.TOOL_CALL_END,),
+            ),
             (ParserState.TOOL_ARGS, "TOOL_END"): Transition(
+                ParserState.CONTENT,
+                (EventType.TOOL_CALL_END,),
+            ),
+            (ParserState.TOOL_ARGS, "TOOL_END_PLAIN"): Transition(
                 ParserState.CONTENT,
                 (EventType.TOOL_CALL_END,),
             ),
@@ -191,7 +262,15 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
                 ParserState.TOOL_NAME,
                 (EventType.TOOL_CALL_START,),
             ),
+            (ParserState.TOOL_BETWEEN, "INVOKE_PREFIX_PLAIN"): Transition(
+                ParserState.TOOL_NAME,
+                (EventType.TOOL_CALL_START,),
+            ),
             (ParserState.TOOL_BETWEEN, "TOOL_END"): Transition(
+                ParserState.CONTENT,
+                (),
+            ),
+            (ParserState.TOOL_BETWEEN, "TOOL_END_PLAIN"): Transition(
                 ParserState.CONTENT,
                 (),
             ),
@@ -230,8 +309,14 @@ class DeepSeekV4Parser(ParserEngine):
         self._arg_converter = self._convert_args
 
     def _convert_args(self, raw_args: str, partial: bool) -> str:
-        result = _dsml_arg_converter(raw_args, partial)
+        func_name = next((s.name for s in self._tool_slots if s.args == raw_args), None)
+        simple_param_names = None
+        if self._tools and func_name:
+            properties = find_tool_properties(self._tools, func_name)
+            if properties:
+                simple_param_names = set(properties.keys())
+
+        result = _dsml_arg_converter(raw_args, partial, simple_param_names)
         if not self._tools:
             return result
-        func_name = next((s.name for s in self._tool_slots if s.args == raw_args), None)
         return _unwrap_wrapper_args(result, self._tools, func_name)
