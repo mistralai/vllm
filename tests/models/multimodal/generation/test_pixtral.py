@@ -16,7 +16,14 @@ from transformers import AutoProcessor
 from vllm import SamplingParams, TextPrompt, TokensPrompt
 from vllm.inputs import MultiModalDataBuiltins
 from vllm.logprobs import Logprob, SampleLogprobs
-from vllm.model_executor.models.pixtral import _make_packed_sequence_metadata
+from vllm.model_executor.models.pixtral import (
+    _make_encoder_cudagraph_capture_images,
+    _make_merge_indices,
+    _make_packed_sequence_metadata,
+    _merge_features_by_index,
+    _pack_image_patches,
+    get_sub_grids,
+)
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -155,6 +162,73 @@ def test_packed_sequence_metadata(backend: AttentionBackendEnum) -> None:
         assert max_seqlen.item() == expected_max_seqlen
         assert cu_seqlens.tolist() == [0, 4, 10]
         assert sequence_lengths is None
+
+
+def test_packed_image_patches_preserve_raster_order() -> None:
+    image = torch.arange(24).view(1, 4, 6)
+
+    packed = _pack_image_patches([image], patch_size=2)
+
+    expected = torch.tensor(
+        [
+            [[[0, 1], [6, 7]]],
+            [[[2, 3], [8, 9]]],
+            [[[4, 5], [10, 11]]],
+            [[[12, 13], [18, 19]]],
+            [[[14, 15], [20, 21]]],
+            [[[16, 17], [22, 23]]],
+        ]
+    )
+    torch.testing.assert_close(packed, expected)
+
+
+def test_packed_image_patches_preserve_patch_projection() -> None:
+    torch.manual_seed(0)
+    images = [torch.randn(3, 4, 6), torch.randn(3, 6, 4)]
+    projection = torch.nn.Conv2d(3, 5, kernel_size=2, stride=2, bias=False)
+
+    eager = torch.cat(
+        [projection(image.unsqueeze(0)).flatten(2).transpose(1, 2) for image in images],
+        dim=1,
+    ).squeeze(0)
+    packed = projection(_pack_image_patches(images, patch_size=2)).flatten(1)
+
+    torch.testing.assert_close(packed, eager)
+
+
+def test_capture_images_respect_pixtral_size_limit() -> None:
+    images, max_seqlen = _make_encoder_cudagraph_capture_images(
+        token_budget=8192,
+        max_batch_size=1,
+        num_channels=3,
+        patch_size=16,
+        max_patches_per_side=64,
+        spatial_merge_size=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert images[0].shape == (3, 1024, 1024)
+    assert max_seqlen == 4096
+
+
+def test_merge_indices_match_eager_patch_merger() -> None:
+    grid_sizes = [(4, 6), (5, 7)]
+    num_tokens = sum(height * width for height, width in grid_sizes)
+    features = torch.arange(num_tokens * 3, dtype=torch.float32).view(num_tokens, 3)
+
+    merge_indices = _make_merge_indices(
+        grid_sizes, spatial_merge_size=2, device=features.device
+    )
+    packed = _merge_features_by_index(features, merge_indices)
+    eager = torch.cat(
+        [
+            grid.view(-1, grid.shape[-1]).t()
+            for grid in get_sub_grids(features, grid_sizes, spatial_merge_size=2)
+        ]
+    )
+
+    torch.testing.assert_close(packed, eager)
 
 
 # For the test author to store golden output in JSON

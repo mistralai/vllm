@@ -75,6 +75,36 @@ def ernie45_vl_chat_template(content: str) -> str:
 
 
 MODEL_CONFIGS: dict[str, VitCudagraphTestConfig] = {
+    "pixtral": VitCudagraphTestConfig(
+        model="mistralai/Ministral-3-3B-Instruct-2512",
+        modalities=["image"],
+        image_prompt="What is in this image?",
+        compilation_config_overrides={
+            "encoder_cudagraph_token_budgets": [4096],
+        },
+        vllm_runner_kwargs={
+            "load_format": "dummy",
+            "tokenizer_mode": "mistral",
+            "config_format": "mistral",
+        },
+        marks=[pytest.mark.core_model],
+    ),
+    "mistral3": VitCudagraphTestConfig(
+        model="mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+        modalities=["image"],
+        image_prompt="<s>[INST][IMG]What is in this image?[/INST]",
+        compilation_config_overrides={
+            "encoder_cudagraph_token_budgets": [4096],
+        },
+        vllm_runner_kwargs={
+            "load_format": "dummy",
+            "hf_overrides": partial(
+                dummy_hf_overrides,
+                model_arch="Mistral3ForConditionalGeneration",
+            ),
+        },
+        marks=[pytest.mark.core_model],
+    ),
     "gemma3": VitCudagraphTestConfig(
         model="google/gemma-3-4b-it",
         modalities=["image"],

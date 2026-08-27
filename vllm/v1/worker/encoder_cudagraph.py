@@ -21,6 +21,7 @@ from vllm.model_executor.models.utils import scatter_output_slices
 from vllm.model_executor.models.vision import get_load_balance_assignment
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import current_stream
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.encoder_cudagraph_defs import (
     EncoderCudaGraphConfig,
     EncoderItemSpec,
@@ -217,6 +218,10 @@ class EncoderCudaGraphManager:
 
     def capture(self, graph_pool: Any):
         """Capture CUDA graphs for every configured path and token budget."""
+        if not self.config.modalities:
+            logger.info("Encoder CUDA graph capture skipped: no supported modalities.")
+            return
+
         self.graph_pool = graph_pool
 
         for path, budgets in self.path_token_budgets.items():
@@ -373,7 +378,8 @@ class EncoderCudaGraphManager:
                 )
                 padding_logic(buf, src)
 
-        graph_meta.graph.replay()
+        with record_function_or_nullcontext("encoder_cudagraph: replay"):
+            graph_meta.graph.replay()
 
         self.graph_hits += num_items
         return graph_meta.output_buffer
