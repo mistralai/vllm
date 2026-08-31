@@ -117,7 +117,9 @@ def _make_packed_sequence_metadata(
         max_seqlen_value = MMEncoderAttention.compute_max_seqlen(
             attn_backend, override_cu_seqlens
         )
-    max_seqlen = torch.tensor(max_seqlen_value, dtype=torch.int32, device=device)
+    # Attention wrappers call .item() on this value, which is baked into the
+    # graph at capture time. Keep it on CPU to avoid a capture-unsafe D2H sync.
+    max_seqlen = torch.tensor(max_seqlen_value, dtype=torch.int32)
     cu_seqlens_tensor = MMEncoderAttention.maybe_recompute_cu_seqlens(
         attn_backend,
         cu_seqlens,

@@ -164,6 +164,32 @@ def test_packed_sequence_metadata(backend: AttentionBackendEnum) -> None:
         assert sequence_lengths is None
 
 
+@pytest.mark.parametrize(
+    "backend",
+    [
+        AttentionBackendEnum.FLASH_ATTN,
+        AttentionBackendEnum.FLASHINFER,
+        AttentionBackendEnum.TRITON_ATTN,
+        AttentionBackendEnum.ROCM_AITER_FA,
+    ],
+)
+def test_packed_sequence_max_seqlen_stays_on_cpu(
+    backend: AttentionBackendEnum,
+) -> None:
+    cu_seqlens, max_seqlen, sequence_lengths = _make_packed_sequence_metadata(
+        [4, 6],
+        backend,
+        hidden_size=64,
+        tp_size=1,
+        device=torch.device("meta"),
+    )
+
+    assert cu_seqlens.device.type == "meta"
+    assert max_seqlen.device.type == "cpu"
+    if sequence_lengths is not None:
+        assert sequence_lengths.device.type == "meta"
+
+
 def test_packed_image_patches_preserve_raster_order() -> None:
     image = torch.arange(24).view(1, 4, 6)
 
