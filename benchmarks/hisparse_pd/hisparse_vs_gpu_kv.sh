@@ -12,8 +12,7 @@
 #   DEVICE_BUFFER_SIZE  optional hot rows/request
 #   ARMS                arms to run (default "gpu-kv hisparse")
 #   RESULTS_ROOT        output root (default bench_results/hisparse_pd_ab_<ts>)
-#   PREFILL_HISPARSE=1  only when baselining against the pre-rework branch,
-#                        where P also required hisparse_config
+#   PREFILL_HISPARSE=1  run hisparse_config on P too (pre-rework parity)
 #
 # Example (single node, 8 GPUs):
 #   MODEL=zai-org/GLM-5.2-FP8 P_TP=4 D_TP=4 HOST_POOL_GIB=64 \
@@ -24,33 +23,27 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 
 ARMS=${ARMS:-"gpu-kv hisparse"}
-HOST_POOL_GIB=${HOST_POOL_GIB:-32}
+HISPARSE_POOL_GIB=${HISPARSE_POOL_GIB:-${HOST_POOL_GIB:-32}}
 DEVICE_BUFFER_SIZE=${DEVICE_BUFFER_SIZE:-}
 PREFILL_HISPARSE=${PREFILL_HISPARSE:-0}
 RESULTS_ROOT=${RESULTS_ROOT:-bench_results/hisparse_pd_ab_$(date +%Y%m%d_%H%M%S)}
 
-HISPARSE_AC='{"hisparse_config":{"host_pool_gib":'"$HOST_POOL_GIB"
-if [[ -n "$DEVICE_BUFFER_SIZE" ]]; then
-    HISPARSE_AC="$HISPARSE_AC"',"device_buffer_size":'"$DEVICE_BUFFER_SIZE"
-fi
-HISPARSE_AC="$HISPARSE_AC"'}}'
-
-if [[ "$PREFILL_HISPARSE" == "1" ]]; then
-    export PREFILL_ATTENTION_CONFIG="$HISPARSE_AC"
-fi
-# pd_bench.sh auto-builds a hisparse config from HOST_POOL_GIB when
-# DECODE_ATTENTION_CONFIG is unset; drop both so each arm is fully explicit.
-unset HOST_POOL_GIB DEVICE_BUFFER_SIZE PREFILL_HISPARSE
+# Arms are expressed purely through HOST_POOL_GIB; pd_bench.sh derives the
+# hisparse attention config and the MultiConnector kv-transfer config from
+# it. Drop any inherited explicit configs so each arm is auto-built.
+export DEVICE_BUFFER_SIZE PREFILL_HISPARSE
+unset HOST_POOL_GIB DECODE_ATTENTION_CONFIG PREFILL_ATTENTION_CONFIG \
+    DECODE_KV_TRANSFER_CONFIG PREFILL_KV_TRANSFER_CONFIG
 
 mkdir -p "$RESULTS_ROOT"
 
 for ARM in $ARMS; do
     case "$ARM" in
         gpu-kv)
-            export DECODE_ATTENTION_CONFIG=""
+            export HOST_POOL_GIB=""
             ;;
         hisparse)
-            export DECODE_ATTENTION_CONFIG="$HISPARSE_AC"
+            export HOST_POOL_GIB="$HISPARSE_POOL_GIB"
             ;;
         *)
             echo "ERROR: unknown arm '$ARM' (expected gpu-kv or hisparse)"
@@ -61,7 +54,7 @@ for ARM in $ARMS; do
     echo ""
     echo "###########################################################"
     echo "# Arm: $ARM"
-    echo "# decode attention config: ${DECODE_ATTENTION_CONFIG:-<none>}"
+    echo "# host pool: ${HOST_POOL_GIB:-<none>} GiB per rank"
     echo "###########################################################"
     ARM_TAG="$ARM" OUTPUT_DIR="$RESULTS_ROOT/$ARM" "$SCRIPT_DIR/pd_bench.sh"
 done

@@ -20,7 +20,7 @@ compared against its baseline:
 - `hisparse_vs_gpu_kv.sh` — A/B driver. Runs `pd_bench.sh` twice on identical
   topology/traffic: arm `gpu-kv` (decode keeps imported KV resident in the
   normal device pools) vs arm `hisparse` (decode lands imported KV in the
-  pinned host pool via `attention_config.hisparse_config`). Engines restart
+  pinned host pool via `HiSparseConnector`). Engines restart
   between arms because the landing policy is fixed at engine startup.
 - `summarize_ab.py` — joins the two arms' result JSONs on
   (concurrency, ISL, OSL) and prints throughput / TTFT p99 / completion
@@ -60,12 +60,16 @@ plain P/D path. Use a small DSA model, e.g. a shrunken DeepSeek-V3.2 with
 
 `pd_bench.sh` resolves the decode-side landing policy in this order:
 
-1. `DECODE_ATTENTION_CONFIG` (verbatim `--attention-config` JSON), else
-2. `HOST_POOL_GIB` (optionally `DEVICE_BUFFER_SIZE`) builds
-   `{"hisparse_config": {...}}`, else
-3. nothing — plain GPU-resident decode.
+1. `DECODE_ATTENTION_CONFIG` + `DECODE_KV_TRANSFER_CONFIG` (verbatim
+   `--attention-config` / `--kv-transfer-config` JSON), else
+2. `HOST_POOL_GIB` (optionally `DEVICE_BUFFER_SIZE`) builds both the
+   `{"hisparse_config": {...}}` attention config and a `MultiConnector`
+   kv-transfer config pairing `KV_CONNECTOR` with
+   `HiSparseConnector(host_pool_gib)`, else
+3. nothing — plain GPU-resident decode with the bare `KV_CONNECTOR`.
 
-`PREFILL_ATTENTION_CONFIG` / `PREFILL_HISPARSE=1` exist only for baselining
+`PREFILL_HISPARSE=1` mirrors the hisparse arm on P (attention config plus
+the matching `MultiConnector` producer config); it exists only for baselining
 against the pre-rework branch (`feat/hisparse-mla-decode-main@9a21608f90`),
 where the NIXL handshake required `hisparse_config` on both roles. On the
 rework branch P stays stock.

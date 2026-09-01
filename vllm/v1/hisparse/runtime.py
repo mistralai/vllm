@@ -74,6 +74,7 @@ class ResolvedHiSparseConfig:
         vllm_config: VllmConfig,
         model_top_k: int,
         block_size: int | None = None,
+        host_pool_gib: float | None = None,
     ) -> ResolvedHiSparseConfig | None:
         config = vllm_config.attention_config.hisparse_config
         if config is None:
@@ -117,7 +118,7 @@ class ResolvedHiSparseConfig:
         return cls(
             top_k=model_top_k,
             device_buffer_size=device_buffer_size,
-            host_pool_gib=config.host_pool_gib,
+            host_pool_gib=host_pool_gib if host_pool_gib is not None else 0.0,
         )
 
 
@@ -128,7 +129,8 @@ def check_hisparse_host_memory(pool_bytes: int) -> None:
         raise ValueError(
             f"HiSparse pinned host pool needs ~{pool_bytes / 2**30:.0f} GiB "
             f"but only {mem.available / 2**30:.0f} GiB of RAM is available. "
-            "Lower hisparse_config.host_pool_gib or leave headroom for co-tenants."
+            "Lower the HiSparseConnector host_pool_gib or leave headroom "
+            "for co-tenants."
         )
 
 

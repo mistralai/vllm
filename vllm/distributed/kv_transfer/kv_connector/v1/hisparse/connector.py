@@ -4,14 +4,12 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
 
 from vllm.config import VllmConfig
-from vllm.config.kv_transfer import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
@@ -32,7 +30,6 @@ from vllm.v1.hisparse.types import SparseKVOffloadCommand
 from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
-    from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.hisparse_coordinator import HiSparseCoordinator
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -112,14 +109,6 @@ class HiSparseConnectorScheduler:
         )
 
 
-def _hisparse_config(vllm_config: VllmConfig) -> VllmConfig:
-    config = copy.copy(vllm_config)
-    config.kv_transfer_config = KVTransferConfig(
-        kv_connector="HiSparseConnector", kv_role="kv_both"
-    )
-    return config
-
-
 class HiSparseConnector(KVConnectorBase_V1, SupportsHMA):
     """Join the scheduler coordinator to the worker's transfer engine."""
 
@@ -128,23 +117,34 @@ class HiSparseConnector(KVConnectorBase_V1, SupportsHMA):
         vllm_config: VllmConfig,
         role: KVConnectorRole,
         kv_cache_config: KVCacheConfig,
-        coordinator: HiSparseCoordinator | None = None,
     ) -> None:
-        super().__init__(_hisparse_config(vllm_config), role, kv_cache_config)
+        super().__init__(vllm_config, role, kv_cache_config)
+        if kv_cache_config.hisparse_host_num_blocks is None:
+            raise ValueError(
+                "HiSparseConnector requires the HiSparse host pool: set "
+                "attention_config.hisparse_config and the connector's "
+                "'host_pool_gib' in kv_connector_extra_config."
+            )
         self.connector_scheduler: HiSparseConnectorScheduler | None = None
         self.connector_worker: HiSparseConnectorWorker | None = None
-        if role == KVConnectorRole.SCHEDULER:
-            if coordinator is None:
-                raise ValueError("HiSparse scheduler requires a coordinator.")
-            self.connector_scheduler = HiSparseConnectorScheduler(coordinator)
-        elif role == KVConnectorRole.WORKER:
-            if coordinator is not None:
-                raise ValueError("HiSparse worker cannot receive a coordinator.")
+        if role == KVConnectorRole.WORKER:
             self.connector_worker = HiSparseConnectorWorker(
                 vllm_config, kv_cache_config
             )
-        else:
+        elif role != KVConnectorRole.SCHEDULER:
             raise ValueError(f"Unsupported KV connector role: {role}")
+
+    def bind_hisparse_coordinator(self, coordinator: HiSparseCoordinator) -> None:
+        """Attach the scheduler-side coordinator (scheduler role only)."""
+        if self.role != KVConnectorRole.SCHEDULER:
+            raise ValueError(
+                "bind_hisparse_coordinator is only valid on the scheduler "
+                "role connector."
+            )
+        assert self.connector_scheduler is None, (
+            "HiSparse coordinator is already bound."
+        )
+        self.connector_scheduler = HiSparseConnectorScheduler(coordinator)
 
     @property
     def requires_kv_delivery(self) -> bool:
@@ -232,25 +232,18 @@ class HiSparseConnector(KVConnectorBase_V1, SupportsHMA):
         return False, None
 
 
-class _HiSparseMultiConnector(MultiConnector):
-    """Compose HiSparse without changing the configured connector's telemetry."""
-
-    def get_kv_connector_stats(self) -> KVConnectorStats | None:
-        return self._connectors[0].get_kv_connector_stats()
-
-
-def attach_hisparse_connector(
+def find_hisparse_connector(
     connector: KVConnectorBase_V1 | None,
-    vllm_config: VllmConfig,
-    role: KVConnectorRole,
-    kv_cache_config: KVCacheConfig,
-    coordinator: HiSparseCoordinator | None = None,
-) -> KVConnectorBase_V1:
-    hisparse_connector = HiSparseConnector(
-        vllm_config, role, kv_cache_config, coordinator
-    )
+) -> HiSparseConnector | None:
+    """Locate the HiSparseConnector in a (possibly composed) connector tree."""
     if connector is None:
-        return hisparse_connector
-    return _HiSparseMultiConnector.from_connectors(
-        vllm_config, role, kv_cache_config, [connector, hisparse_connector]
-    )
+        return None
+    if isinstance(connector, MultiConnector):
+        for child in connector.sub_connectors:
+            found = find_hisparse_connector(child)
+            if found is not None:
+                return found
+        return None
+    if isinstance(connector, HiSparseConnector):
+        return connector
+    return None

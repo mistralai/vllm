@@ -7,8 +7,11 @@
 # then tears everything down.
 #
 # One arm per invocation: what the decode side does with imported KV is
-# selected by HOST_POOL_GIB / DECODE_ATTENTION_CONFIG (both empty = plain
-# GPU-resident decode, i.e. the GPU-KV baseline arm of the #46326 A/B).
+# selected by HOST_POOL_GIB (empty = plain GPU-resident decode, i.e. the
+# GPU-KV baseline arm of the #46326 A/B). HOST_POOL_GIB auto-builds the
+# hisparse attention config and a MultiConnector kv-transfer config pairing
+# $KV_CONNECTOR with HiSparseConnector(host_pool_gib); explicit
+# DECODE_ATTENTION_CONFIG / *_KV_TRANSFER_CONFIG env vars override.
 #
 # Replicates the measurement shape of:
 #   - #53781 e2e: GLM ISL/OSL points 20k/10k, 32k/8k, 60k/10k, concurrency sweep
@@ -39,12 +42,15 @@ MAX_NUM_SEQS_D=${MAX_NUM_SEQS_D:-96}
 ENFORCE_EAGER=${ENFORCE_EAGER:-0}
 KV_CONNECTOR=${KV_CONNECTOR:-NixlConnector}
 
-# HiSparse arm selection. Explicit DECODE_ATTENTION_CONFIG wins; otherwise
-# HOST_POOL_GIB builds one. Empty both = plain GPU-KV decode.
+# HiSparse arm selection. Explicit DECODE_ATTENTION_CONFIG /
+# DECODE_KV_TRANSFER_CONFIG / PREFILL_KV_TRANSFER_CONFIG win; otherwise
+# HOST_POOL_GIB builds them. Empty both = plain GPU-KV decode.
 DECODE_ATTENTION_CONFIG=${DECODE_ATTENTION_CONFIG:-}
 PREFILL_ATTENTION_CONFIG=${PREFILL_ATTENTION_CONFIG:-}
 HOST_POOL_GIB=${HOST_POOL_GIB:-}
 DEVICE_BUFFER_SIZE=${DEVICE_BUFFER_SIZE:-}
+DECODE_KV_TRANSFER_CONFIG=${DECODE_KV_TRANSFER_CONFIG:-}
+PREFILL_KV_TRANSFER_CONFIG=${PREFILL_KV_TRANSFER_CONFIG:-}
 # Set on the pre-rework branch only (hisparse_config had to be enabled on P
 # there or the NIXL handshake fails).
 PREFILL_HISPARSE=${PREFILL_HISPARSE:-0}
@@ -84,15 +90,28 @@ if [[ -z "$VLLM_BIN" || -z "$PY_BIN" ]]; then
 fi
 
 if [[ -z "$DECODE_ATTENTION_CONFIG" && -n "$HOST_POOL_GIB" ]]; then
-    DECODE_ATTENTION_CONFIG='{"hisparse_config":{"host_pool_gib":'"$HOST_POOL_GIB"
+    DECODE_ATTENTION_CONFIG='{"hisparse_config":{'
     if [[ -n "$DEVICE_BUFFER_SIZE" ]]; then
-        DECODE_ATTENTION_CONFIG="$DECODE_ATTENTION_CONFIG"',"device_buffer_size":'"$DEVICE_BUFFER_SIZE"
+        DECODE_ATTENTION_CONFIG="$DECODE_ATTENTION_CONFIG"'"device_buffer_size":'"$DEVICE_BUFFER_SIZE"
     fi
     DECODE_ATTENTION_CONFIG="$DECODE_ATTENTION_CONFIG"'}}'
 fi
 if [[ -z "$PREFILL_ATTENTION_CONFIG" && "$PREFILL_HISPARSE" == "1" && -n "$HOST_POOL_GIB" ]]; then
     PREFILL_ATTENTION_CONFIG="$DECODE_ATTENTION_CONFIG"
 fi
+
+# HOST_POOL_GIB lives on HiSparseConnector's extra config; PD decode pairs it
+# with the regular transfer connector through MultiConnector.
+if [[ -n "$HOST_POOL_GIB" ]]; then
+    if [[ -z "$DECODE_KV_TRANSFER_CONFIG" ]]; then
+        DECODE_KV_TRANSFER_CONFIG='{"kv_connector":"MultiConnector","kv_role":"kv_consumer","kv_connector_extra_config":{"connectors":[{"kv_connector":"'"$KV_CONNECTOR"'","kv_role":"kv_consumer"},{"kv_connector":"HiSparseConnector","kv_role":"kv_both","kv_connector_extra_config":{"host_pool_gib":'"$HOST_POOL_GIB"'}}]}}'
+    fi
+    if [[ "$PREFILL_HISPARSE" == "1" && -z "$PREFILL_KV_TRANSFER_CONFIG" ]]; then
+        PREFILL_KV_TRANSFER_CONFIG='{"kv_connector":"MultiConnector","kv_role":"kv_producer","kv_connector_extra_config":{"connectors":[{"kv_connector":"'"$KV_CONNECTOR"'","kv_role":"kv_producer"},{"kv_connector":"HiSparseConnector","kv_role":"kv_both","kv_connector_extra_config":{"host_pool_gib":'"$HOST_POOL_GIB"'}}]}}'
+    fi
+fi
+[[ -n "$PREFILL_KV_TRANSFER_CONFIG" ]] || PREFILL_KV_TRANSFER_CONFIG="{\"kv_connector\":\"$KV_CONNECTOR\",\"kv_role\":\"kv_producer\"}"
+[[ -n "$DECODE_KV_TRANSFER_CONFIG" ]] || DECODE_KV_TRANSFER_CONFIG="{\"kv_connector\":\"$KV_CONNECTOR\",\"kv_role\":\"kv_consumer\"}"
 
 mkdir -p "$OUTPUT_DIR"
 LOGDIR="$OUTPUT_DIR/logs"
@@ -168,6 +187,8 @@ wait_for_gpus_free() { # best effort before launching engines
     echo "arm: $ARM_TAG"
     echo "decode_attention_config: ${DECODE_ATTENTION_CONFIG:-<none>}"
     echo "prefill_attention_config: ${PREFILL_ATTENTION_CONFIG:-<none>}"
+    echo "decode_kv_transfer_config: $DECODE_KV_TRANSFER_CONFIG"
+    echo "prefill_kv_transfer_config: $PREFILL_KV_TRANSFER_CONFIG"
     echo "topology: ${NUM_PREFILL}P(tp=${P_TP},pp=${P_PP}) + ${NUM_DECODE}D(tp=${D_TP})"
     echo "block_size: $BLOCK_SIZE  max_model_len: $MAX_MODEL_LEN  max_num_seqs_d: $MAX_NUM_SEQS_D"
     echo "grid: pairs=[$ISL_OSL_PAIRS] concurrencies=[$CONCURRENCIES] num_prompts=$NUM_PROMPTS"
@@ -207,7 +228,7 @@ for i in $(seq 0 $((NUM_PREFILL - 1))); do
         --tensor-parallel-size "$P_TP" \
         --pipeline-parallel-size "$P_PP" \
         --max-model-len "$MAX_MODEL_LEN" \
-        --kv-transfer-config "{\"kv_connector\":\"$KV_CONNECTOR\",\"kv_role\":\"kv_producer\"}" \
+        --kv-transfer-config "$PREFILL_KV_TRANSFER_CONFIG" \
         "${EAGER_FLAGS[@]}" "${P_AC_FLAGS[@]}" $P_EXTRA_ARGS \
         > "$LOGDIR/prefill_${i}.log" 2>&1 &
     PIDS+=($!)
@@ -231,7 +252,7 @@ for i in $(seq 0 $((NUM_DECODE - 1))); do
         --tensor-parallel-size "$D_TP" \
         --max-model-len "$MAX_MODEL_LEN" \
         --max-num-seqs "$MAX_NUM_SEQS_D" \
-        --kv-transfer-config "{\"kv_connector\":\"$KV_CONNECTOR\",\"kv_role\":\"kv_consumer\"}" \
+        --kv-transfer-config "$DECODE_KV_TRANSFER_CONFIG" \
         "${EAGER_FLAGS[@]}" "${D_AC_FLAGS[@]}" $D_EXTRA_ARGS \
         > "$LOGDIR/decode_${i}.log" 2>&1 &
     PIDS+=($!)

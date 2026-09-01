@@ -14,6 +14,7 @@ from typing import Any, NamedTuple, NewType, TypeAlias, overload
 
 from vllm import envs
 from vllm.config import VllmConfig
+from vllm.config.kv_transfer import hisparse_host_pool_gib
 from vllm.logger import init_logger
 from vllm.utils.hashing import xxhash, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
@@ -1362,10 +1363,24 @@ def validate_kv_cache_layout(
 
 def _hisparse_host_pool_bytes(vllm_config: VllmConfig) -> int | None:
     """Return per-replica HiSparse host-cache capacity in bytes."""
-    config = vllm_config.attention_config.hisparse_config
-    if config is None:
-        return None
-    return int(config.host_pool_gib * 2**30)
+    host_pool_gib = hisparse_host_pool_gib(vllm_config.kv_transfer_config)
+    has_hisparse_attention = vllm_config.attention_config.hisparse_config is not None
+    if host_pool_gib is not None and not has_hisparse_attention:
+        raise ValueError(
+            "HiSparseConnector is configured (host_pool_gib="
+            f"{host_pool_gib}) but attention_config.hisparse_config is "
+            "not set. HiSparse requires both."
+        )
+    if has_hisparse_attention and host_pool_gib is None:
+        raise ValueError(
+            "attention_config.hisparse_config is set but no "
+            "HiSparseConnector with 'host_pool_gib' is configured in "
+            "kv_transfer_config. Configure it via "
+            '\'{"kv_connector": "HiSparseConnector", '
+            '"kv_connector_extra_config": {"host_pool_gib": ...}}\' '
+            "(directly or inside a MultiConnector 'connectors' list)."
+        )
+    return int(host_pool_gib * 2**30) if host_pool_gib is not None else None
 
 
 HISPARSE_HOT_SUFFIX = ".hisparse_hot"
@@ -1427,6 +1442,7 @@ def _get_hisparse_hma_config(
         vllm_config,
         vllm_config.model_config.hf_config.index_topk,
         gpu_block_size,
+        host_pool_gib=host_budget / 2**30,
     )
     assert config is not None
 

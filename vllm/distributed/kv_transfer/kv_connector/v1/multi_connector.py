@@ -206,6 +206,11 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         # Propagated from scheduler to worker side via the connector metadata.
         self._extra_async_saves: dict[str, int] = {}
 
+    @property
+    def sub_connectors(self) -> list[KVConnectorBase_V1]:
+        """The composed child connectors, in configuration order."""
+        return list(self._connectors)
+
     @classmethod
     def from_connectors(
         cls,

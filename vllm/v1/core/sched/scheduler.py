@@ -24,7 +24,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.connector import (
-    attach_hisparse_connector,
+    find_hisparse_connector,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
@@ -303,15 +303,14 @@ class Scheduler(SchedulerInterface):
             watermark=self.scheduler_config.watermark,
         )
         if self.kv_cache_config.hisparse_host_num_blocks is not None:
-            hisparse_coordinator = self.kv_cache_manager.hisparse_coordinator
-            self.connector = attach_hisparse_connector(
-                self.connector,
-                self.vllm_config,
-                KVConnectorRole.SCHEDULER,
-                self.kv_cache_config,
-                hisparse_coordinator,
+            hisparse_connector = find_hisparse_connector(self.connector)
+            assert hisparse_connector is not None, (
+                "HiSparse host pool is configured but the connector tree "
+                "contains no HiSparseConnector."
             )
-            self.requires_kv_delivery = self.connector.requires_kv_delivery
+            hisparse_connector.bind_hisparse_coordinator(
+                self.kv_cache_manager.hisparse_coordinator
+            )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:

@@ -13,6 +13,52 @@ KVConsumer = Literal["kv_consumer", "kv_both"]
 KVRole = Literal[KVProducer, KVConsumer]
 
 
+def hisparse_host_pool_gib(
+    kv_transfer_config: "KVTransferConfig | None",
+) -> float | None:
+    """Host-pool capacity configured on the HiSparseConnector entry.
+
+    Reads the ``host_pool_gib`` field of the HiSparseConnector's
+    ``kv_connector_extra_config``, resolving through MultiConnector
+    composition. Returns None when no HiSparseConnector is configured.
+    """
+    if kv_transfer_config is None:
+        return None
+    if kv_transfer_config.kv_connector == "MultiConnector":
+        entries: list[tuple[str | None, dict[str, Any]]] = [
+            (
+                entry.get("kv_connector"),
+                entry.get("kv_connector_extra_config", {}),
+            )
+            for entry in kv_transfer_config.kv_connector_extra_config.get(
+                "connectors", []
+            )
+        ]
+    else:
+        entries = [
+            (
+                kv_transfer_config.kv_connector,
+                kv_transfer_config.kv_connector_extra_config,
+            )
+        ]
+    found: list[float] = []
+    for name, extra in entries:
+        if name != "HiSparseConnector":
+            continue
+        gib = extra.get("host_pool_gib")
+        if gib is None:
+            raise ValueError(
+                "HiSparseConnector requires 'host_pool_gib' in "
+                "kv_connector_extra_config."
+            )
+        found.append(float(gib))
+    if len(found) > 1:
+        raise ValueError(
+            f"At most one HiSparseConnector entry may be configured, got {len(found)}."
+        )
+    return found[0] if found else None
+
+
 def kv_buffer_device_default_factory() -> str:
     from vllm.platforms import current_platform
 
