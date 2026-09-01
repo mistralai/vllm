@@ -14,7 +14,6 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
-    HiSparseResidentSpec,
     KVCacheSpec,
     MambaSpec,
 )
@@ -35,7 +34,7 @@ class ReadSpec:
 
 
 def _is_attention_spec(spec_type: type[KVCacheSpec]) -> bool:
-    return issubclass(spec_type, (AttentionSpec, HiSparseResidentSpec))
+    return issubclass(spec_type, AttentionSpec)
 
 
 def _is_ssm_spec(spec_type: type[KVCacheSpec]) -> bool:
