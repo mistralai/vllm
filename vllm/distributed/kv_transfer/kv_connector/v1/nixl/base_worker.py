@@ -120,6 +120,11 @@ class NixlBaseConnectorWorker:
     # Overridden by NixlPushConnectorWorker.
     _TRANSFER_MODE: str = "pull"
 
+    @property
+    def _mixed_mem_types(self) -> bool:
+        """Whether registered regions span more than one memory type."""
+        return len(set(self.region_mem_types)) > 1
+
     def _compute_desc_ids(
         self,
         block_ids: BlockIds,
@@ -221,6 +226,38 @@ class NixlBaseConnectorWorker:
                 )
 
         return np.concatenate(all_descs)
+
+    def _mem_type_partitions(
+        self, region_group_ids: list[int], num_entries: int
+    ) -> dict[str, list[int]]:
+        """Partition block-id list entries by their regions' memory type.
+
+        Entries index a ``block_ids`` list: regions for region-mapped specs,
+        cache groups otherwise. Each entry's regions must share one memory
+        type, and no region may be shared across entries.
+        """
+        group_arr = np.asarray(region_group_ids)
+        if (group_arr == _SHARED_REGION_GROUP_ID).any():
+            raise NotImplementedError(
+                "Mixed-memory transfers do not support regions shared "
+                "across cache groups."
+            )
+        partitions: dict[str, list[int]] = {}
+        for entry in range(num_entries):
+            region_ids = np.flatnonzero(group_arr == entry)
+            if region_ids.size == 0:
+                continue
+            mem_types = {self.region_mem_types[r] for r in region_ids}
+            if len(mem_types) > 1:
+                raise NotImplementedError(
+                    f"block_ids entry {entry} spans memory types "
+                    f"{sorted(mem_types)}; mixed-memory transfers need "
+                    "single-type entries."
+                )
+            partitions.setdefault(mem_types.pop(), []).append(entry)
+        if not partitions:
+            raise ValueError("No regions match the transfer's block-id entries.")
+        return partitions
 
     def _build_local_splits_from_plan(
         self,
@@ -505,9 +542,6 @@ class NixlBaseConnectorWorker:
         self.region_group_ids: list[int] = []
         self.region_names: list[str] = []
         self.region_num_blocks: list[int] = []
-        self._mixed_mem_types = False
-        self._desc_is_dram_by_block_size: dict[int, np.ndarray] = {}
-        self._desc_pos_by_block_size: dict[int, np.ndarray] = {}
         self._dram_src_handles_by_block_size: dict[int, int] = {}
 
         # PP>1 (push mode): this worker holds a contiguous layer slice and
@@ -1345,7 +1379,6 @@ class NixlBaseConnectorWorker:
         # Total local FA descriptors (boundary between FA and mamba descs).
         self.num_descs = sum(self.region_num_blocks)
 
-        self._mixed_mem_types = len(set(region_mem_types)) > 1
         if self._mixed_mem_types:
             assert self.use_mla and not self._has_mamba, (
                 "Mixed-device KV registration is only supported for MLA "
@@ -1639,47 +1672,37 @@ class NixlBaseConnectorWorker:
             blocks_data = np.concatenate([blocks_data, mamba])
 
         if self._mixed_mem_types:
-            desc_is_dram = np.concatenate(
-                [
-                    np.full(
-                        count * block_size_ratio,
-                        mem_type == "DRAM",
-                        dtype=bool,
-                    )
-                    for mem_type, count in zip(
-                        self.region_mem_types,
-                        self.region_num_blocks,
-                        strict=True,
-                    )
-                ]
-            )
-            assert len(desc_is_dram) == len(blocks_data)
-            desc_pos = np.empty(len(desc_is_dram), dtype=np.int64)
-            dram_idx = np.where(desc_is_dram)[0]
-            vram_idx = np.where(~desc_is_dram)[0]
-            desc_pos[dram_idx] = np.arange(len(dram_idx), dtype=np.int64)
-            desc_pos[vram_idx] = np.arange(len(vram_idx), dtype=np.int64)
-            self._desc_is_dram_by_block_size[block_size] = desc_is_dram
-            self._desc_pos_by_block_size[block_size] = desc_pos
+            # NIXL descriptor lists are single memory type, so split the
+            # region-major descriptor sequence by memory type. DRAM
+            # descriptors are registered under CPU device 0.
+            typed_parts: dict[str, list[np.ndarray]] = {}
+            start = 0
+            for mem_type, count in zip(
+                self.region_mem_types,
+                self.region_num_blocks,
+                strict=True,
+            ):
+                end = start + count * block_size_ratio
+                if mem_type == "DRAM":
+                    blocks_data[start:end, 2] = 0
+                typed_parts.setdefault(mem_type, []).append(blocks_data[start:end])
+                start = end
+            assert start == len(blocks_data)
 
-            # DRAM descriptors are registered under CPU device 0.
-            blocks_data = [
-                (addr, length, 0) if is_dram else (addr, length, dev)
-                for (addr, length, dev), is_dram in zip(
-                    blocks_data, desc_is_dram, strict=True
+            vram_handle = None
+            for mem_type, parts in typed_parts.items():
+                descs = self.nixl_wrapper.get_xfer_descs(
+                    np.concatenate(parts), mem_type
                 )
-            ]
-            dram_blocks = [blocks_data[i] for i in dram_idx]
-            vram_blocks = [blocks_data[i] for i in vram_idx]
-            dram_descs = self.nixl_wrapper.get_xfer_descs(dram_blocks, "DRAM")
-            self._dram_src_handles_by_block_size[block_size] = (
-                self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", dram_descs)
+                handle = self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
+                if mem_type == "DRAM":
+                    self._dram_src_handles_by_block_size[block_size] = handle
+                else:
+                    vram_handle = handle
+            assert vram_handle is not None, (
+                "Mixed registration requires a non-DRAM memory type."
             )
-            descs = self.nixl_wrapper.get_xfer_descs(vram_blocks, self.nixl_memory_type)
-            return (
-                self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs),
-                blocks_data,
-            )
+            return vram_handle, blocks_data
 
         mem_type = self.region_mem_types[0]
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, mem_type)

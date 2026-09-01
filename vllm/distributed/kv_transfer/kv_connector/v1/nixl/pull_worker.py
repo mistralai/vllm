@@ -358,6 +358,14 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # corresponding rank. With heterogeneous TP, fixing D>P, the D tp
         # workers will issue xfers to parts of the P worker remote kv caches.
 
+        # Region-group layout of the local side; entries of the block-id
+        # lists are regions for region-mapped specs, cache groups otherwise.
+        local_region_group_ids = (
+            list(range(self.num_regions))
+            if read_spec.block_ids_by_region
+            else (self.region_group_ids or None)
+        )
+
         # Get descs ids.
         remote_block_descs_ids = self._compute_desc_ids(
             block_ids=remote_block_ids,
@@ -371,17 +379,46 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 else (self.dst_region_group_ids.get(dst_engine_id) or None)
             ),
         )
+
+        if self._mixed_mem_types:
+            # Mixed-memory registrations span several descriptor lists, so
+            # one READ is posted per memory type; the flat local descriptor
+            # ids below are never used.
+            handle = None
+            try:
+                self._read_blocks_by_mem_type(
+                    read_spec=read_spec,
+                    request_id=request_id,
+                    dst_engine_id=dst_engine_id,
+                    remote_block_descs_ids=remote_block_descs_ids,
+                    local_region_group_ids=local_region_group_ids,
+                    local_vram_handle=local_xfer_side_handle,
+                    remote_xfer_side_handle=remote_xfer_side_handle,
+                    block_size_ratio=block_size_ratio,
+                    local_block_size_key=remote_info.remote_block_size,
+                    notif_id=notif_id,
+                )
+                return True
+            except Exception as e:
+                # mark all (logical) blocks for this request as invalid
+                self._log_failure(
+                    failure_type="transfer_setup_failed",
+                    req_id=request_id,
+                    msg="Marking blocks as invalid",
+                    error=e,
+                    dst_engine_id=dst_engine_id,
+                    remote_rank=remote_rank,
+                )
+                self._handle_failed_transfer(request_id, handle)
+                return False
+
         local_block_descs_ids = self._compute_desc_ids(
             block_ids=local_block_ids,
             dst_num_blocks=self.dst_num_blocks[self.engine_id],
             block_size_ratio=block_size_ratio,
             physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
             region_num_blocks=(self.dst_region_num_blocks.get(self.engine_id) or None),
-            region_group_ids=(
-                list(range(self.num_regions))
-                if read_spec.block_ids_by_region
-                else (self.region_group_ids or None)
-            ),
+            region_group_ids=local_region_group_ids,
         )
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
@@ -389,18 +426,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # Prepare transfer with Nixl.
         handle = None
         try:
-            if self._mixed_mem_types:
-                self._read_blocks_mixed(
-                    request_id=request_id,
-                    local_block_size_key=remote_info.remote_block_size,
-                    local_vram_handle=local_xfer_side_handle,
-                    remote_xfer_side_handle=remote_xfer_side_handle,
-                    local_block_descs_ids=local_block_descs_ids,
-                    remote_block_descs_ids=remote_block_descs_ids,
-                    notif_agent=self._remote_agents[dst_engine_id][(0, remote_rank)],
-                    notif_id=notif_id,
-                )
-                return True
             handle = self.nixl_wrapper.make_prepped_xfer(
                 "READ",
                 local_xfer_side_handle,
@@ -429,54 +454,98 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             self._handle_failed_transfer(request_id, handle)
             return False
 
-    def _read_blocks_mixed(
+    def _read_blocks_by_mem_type(
         self,
+        read_spec: ReadSpec,
         request_id: str,
-        local_block_size_key: int,
+        dst_engine_id: str,
+        remote_block_descs_ids: np.ndarray,
+        local_region_group_ids: list[int] | None,
         local_vram_handle: int,
         remote_xfer_side_handle: int,
-        local_block_descs_ids: np.ndarray,
-        remote_block_descs_ids: np.ndarray,
-        notif_agent: str,
+        block_size_ratio: int | None,
+        local_block_size_key: int,
         notif_id: bytes,
     ) -> None:
-        """Split a READ across DRAM and VRAM descriptor lists."""
-        desc_is_dram = self._desc_is_dram_by_block_size[local_block_size_key]
-        desc_pos = self._desc_pos_by_block_size[local_block_size_key]
-        dram_handle = self._dram_src_handles_by_block_size[local_block_size_key]
+        """Post one READ per memory type over a mixed-memory registration.
 
-        local_ids = np.asarray(local_block_descs_ids)
-        remote_ids = np.asarray(remote_block_descs_ids)
-        is_dram = desc_is_dram[local_ids]
+        Local descriptor lists are split by memory type at registration, so
+        descriptor ids are computed per partition while the remote side keeps
+        its flat ids, sliced at the partitions' entry segments. P is freed
+        only once every partition's READ completes, hence the deferred
+        notification.
+        """
+        local_block_ids = read_spec.local_block_ids
+        region_group_ids = local_region_group_ids
+        if region_group_ids is None:
+            region_group_ids = self.region_group_ids
+        if not region_group_ids and self.num_regions == 1:
+            region_group_ids = [0]
+        group_arr = np.asarray(region_group_ids)
+        partitions = self._mem_type_partitions(region_group_ids, len(local_block_ids))
 
-        handles = []
+        # Flat local and remote descriptor ids pair positionally, so each
+        # entry owns a contiguous segment of both arrays.
+        segments: list[slice] = []
+        start = 0
+        for entry, blocks in enumerate(local_block_ids):
+            length = len(blocks) * int((group_arr == entry).sum())
+            segments.append(slice(start, start + length))
+            start += length
+        assert start == len(remote_block_descs_ids)
+
+        reads: list[tuple[int, np.ndarray, np.ndarray]] = []
+        for mem_type, entries in partitions.items():
+            entry_pos = {entry: pos for pos, entry in enumerate(entries)}
+            region_ids = np.flatnonzero(np.isin(group_arr, entries))
+            local_ids = self._compute_desc_ids(
+                block_ids=[local_block_ids[i] for i in entries],
+                dst_num_blocks=self.dst_num_blocks[self.engine_id],
+                block_size_ratio=block_size_ratio,
+                physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
+                region_num_blocks=[self.region_num_blocks[r] for r in region_ids],
+                region_group_ids=[entry_pos[region_group_ids[r]] for r in region_ids],
+            )
+            if len(local_ids) == 0:
+                continue
+            remote_ids = np.concatenate(
+                [remote_block_descs_ids[segments[i]] for i in entries]
+            )
+            assert len(local_ids) == len(remote_ids)
+            if mem_type == "DRAM":
+                local_handle = self._dram_src_handles_by_block_size[
+                    local_block_size_key
+                ]
+            else:
+                local_handle = local_vram_handle
+            reads.append((local_handle, local_ids, remote_ids))
+
+        prepped: list[int] = []
         try:
-            for type_mask, local_handle in (
-                (is_dram, dram_handle),
-                (~is_dram, local_vram_handle),
-            ):
-                handles.append(
+            for local_handle, local_ids, remote_ids in reads:
+                prepped.append(
                     self.nixl_wrapper.make_prepped_xfer(
                         "READ",
                         local_handle,
-                        desc_pos[local_ids[type_mask]],
+                        local_ids,
                         remote_xfer_side_handle,
-                        remote_ids[type_mask],
+                        remote_ids,
                     )
                 )
         except Exception:
-            for handle in handles:
+            for handle in prepped:
                 self.nixl_wrapper.release_xfer_handle(handle)
             raise
 
+        notif_agent = self._remote_agents[dst_engine_id][(0, read_spec.remote_rank)]
         self._pending_recv_notifs.setdefault(request_id, []).append(
             (notif_agent, notif_id)
         )
-        for i, handle in enumerate(handles):
+        for i, handle in enumerate(prepped):
             try:
                 self.nixl_wrapper.transfer(handle)
             except Exception:
-                for unstarted in handles[i:]:
+                for unstarted in prepped[i:]:
                     self.nixl_wrapper.release_xfer_handle(unstarted)
                 raise
             self._recving_transfers[request_id].append(handle)
