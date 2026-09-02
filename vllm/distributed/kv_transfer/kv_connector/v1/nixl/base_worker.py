@@ -544,7 +544,6 @@ class NixlBaseConnectorWorker:
         self.region_group_ids: list[int] = []
         self.region_names: list[str] = []
         self.region_num_blocks: list[int] = []
-        self._dram_src_handles_by_block_size: dict[int, int] = {}
 
         # PP>1 (push mode): this worker holds a contiguous layer slice and
         # transfers into the matching sub-range of a PP=1 remote's regions.
@@ -565,16 +564,22 @@ class NixlBaseConnectorWorker:
         # Keep heartbeat handshakes to a PP-sharded producer notif-only.
         self._hb_handshake_notif_only = False
 
-        # nixl_prepped_dlist_handle.
-        self.src_xfer_handles_by_block_size: dict[int, int] = {}
+        # nixl_prepped_dlist_handle. NIXL descriptor lists are single memory
+        # type, so handles are keyed by the regions' memory types; a
+        # single-type registration holds exactly one entry.
+        self.src_xfer_handles_by_block_size: dict[int, dict[str, int]] = {}
         # Local descriptor arrays per remote block size (block_size_ratio>1),
         # kept for building per-tp-ratio splits at the same granularity.
         self.src_blocks_data_by_block_size: dict[int, np.ndarray] = {}
         # Populated dynamically during handshake based on remote configuration.
         # Per-source split handles, keyed by (tp_ratio, remote_block_size).
-        self.src_xfer_handles_by_tp_ratio: dict[tuple[int, int], list[int]] = {}
-        # Map of engine_id -> {tp_rank: nixl_prepped_dlist_handle (int)}.
-        self.dst_xfer_side_handles = defaultdict[EngineId, dict[int, int]](dict)
+        self.src_xfer_handles_by_tp_ratio: dict[
+            tuple[int, int], list[dict[str, int]]
+        ] = {}
+        # Map of engine_id -> {tp_rank: {mem_type: nixl_prepped_dlist_handle}}.
+        self.dst_xfer_side_handles = defaultdict[EngineId, dict[int, dict[str, int]]](
+            dict
+        )
 
         # Map of engine_id -> num_blocks. All ranks in the same deployment will
         # have the same number of blocks.
@@ -582,12 +587,6 @@ class NixlBaseConnectorWorker:
         self.dst_region_num_blocks: dict[EngineId, list[int]] = {}
         self.dst_region_group_ids: dict[EngineId, list[int]] = {}
         self.dst_region_mem_types: dict[EngineId, list[str]] = {}
-        # Remote dlists split by the remote's memory types, for engines whose
-        # regions span more than one (e.g. a HiSparse DRAM host pool next to
-        # VRAM GPU pools). engine_id -> {tp_rank: {mem_type: handle}}.
-        self.dst_xfer_side_handles_by_mem_type: dict[
-            EngineId, dict[int, dict[str, int]]
-        ] = {}
         self._registered_descs: list[Any] = []
 
         # In progress transfers.
@@ -1758,10 +1757,9 @@ class NixlBaseConnectorWorker:
     def register_local_xfer_handler(
         self,
         block_size: int,
-    ) -> tuple[int, np.ndarray]:
+    ) -> tuple[dict[str, int], np.ndarray]:
         """
-        Function used for register local xfer handler with local block_size or
-        Remote block_size.
+        Register local xfer dlists with local block_size or remote block_size.
 
         When local block_size is same as remote block_size, we use local block_size
         to register local_xfer_handler during init.
@@ -1769,6 +1767,8 @@ class NixlBaseConnectorWorker:
         When remote block size is less than local block size, we need to use
         register another local_xfer_handler using remote block len to ensure
         data copy correctness.
+
+        Returns one dlist handle per memory type and the flat descriptor rows.
         """
         assert self.transfer_topo is not None
         block_size_ratio = self.block_size // block_size
@@ -1794,43 +1794,41 @@ class NixlBaseConnectorWorker:
             mamba = self._build_mamba_local(local_base_addresses)
             blocks_data = np.concatenate([blocks_data, mamba])
 
-        if self._mixed_mem_types:
-            # NIXL descriptor lists are single memory type, so split the
-            # region-major descriptor sequence by memory type. DRAM
-            # descriptors are registered under CPU device 0.
-            typed_parts: dict[str, list[np.ndarray]] = {}
-            start = 0
-            for mem_type, count in zip(
-                self.region_mem_types,
-                self.region_num_blocks,
-                strict=True,
-            ):
-                end = start + count * block_size_ratio
-                if mem_type == "DRAM":
-                    blocks_data[start:end, 2] = 0
-                typed_parts.setdefault(mem_type, []).append(blocks_data[start:end])
-                start = end
-            assert start == len(blocks_data)
-
-            vram_handle = None
-            for mem_type, parts in typed_parts.items():
-                descs = self.nixl_wrapper.get_xfer_descs(
-                    np.concatenate(parts), mem_type
-                )
-                handle = self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
-                if mem_type == "DRAM":
-                    self._dram_src_handles_by_block_size[block_size] = handle
-                else:
-                    vram_handle = handle
-            assert vram_handle is not None, (
-                "Mixed registration requires a non-DRAM memory type."
+        # NIXL descriptor lists are single memory type, so split the
+        # region-major descriptor sequence by memory type, one dlist per
+        # type. DRAM descriptors are registered under CPU device 0. Mamba
+        # rows concatenate after the FA rows without region alignment, so
+        # they keep the legacy flat dlist (mixed memory is MLA-only).
+        if self._has_mamba:
+            mem_type = self.region_mem_types[0]
+            descs = self.nixl_wrapper.get_xfer_descs(blocks_data, mem_type)
+            return (
+                {mem_type: self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)},
+                blocks_data,
             )
-            return vram_handle, blocks_data
 
-        mem_type = self.region_mem_types[0]
-        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, mem_type)
-        # NIXL_INIT_AGENT to be used for preparations of local descs.
-        return self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs), blocks_data
+        typed_parts: dict[str, list[np.ndarray]] = {}
+        start = 0
+        for mem_type, count in zip(
+            self.region_mem_types,
+            self.region_num_blocks,
+            strict=True,
+        ):
+            end = start + count * block_size_ratio
+            if mem_type == "DRAM":
+                blocks_data[start:end, 2] = 0
+            typed_parts.setdefault(mem_type, []).append(blocks_data[start:end])
+            start = end
+        assert start == len(blocks_data)
+
+        handles: dict[str, int] = {}
+        for mem_type, parts in typed_parts.items():
+            descs = self.nixl_wrapper.get_xfer_descs(np.concatenate(parts), mem_type)
+            # NIXL_INIT_AGENT to be used for preparations of local descs.
+            handles[mem_type] = self.nixl_wrapper.prep_xfer_dlist(
+                "NIXL_INIT_AGENT", descs
+            )
+        return handles, blocks_data
 
     def add_remote_agent(
         self,
@@ -2019,6 +2017,12 @@ class NixlBaseConnectorWorker:
             # MLA+SSM also needs this path: MLA is replicated and read once,
             # while the SSM state is sharded across every remote TP rank.
             # We only do this once per remote (tp_size, block_size).
+            if self._mixed_mem_types:
+                raise NotImplementedError(
+                    "Heterogeneous TP is not supported with mixed-memory "
+                    "local registrations."
+                )
+            mem_type = self.region_mem_types[0]
             self.src_xfer_handles_by_tp_ratio[split_key] = []
 
             for handle_data in self._build_local_splits_from_plan(
@@ -2027,11 +2031,9 @@ class NixlBaseConnectorWorker:
                 self.num_descs * block_size_ratio,
                 block_size_ratio,
             ):
-                descs = self.nixl_wrapper.get_xfer_descs(
-                    handle_data, self.nixl_memory_type
-                )
+                descs = self.nixl_wrapper.get_xfer_descs(handle_data, mem_type)
                 handle = self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
-                self.src_xfer_handles_by_tp_ratio[split_key].append(handle)
+                self.src_xfer_handles_by_tp_ratio[split_key].append({mem_type: handle})
 
         ### Register remote agent memory regions
         # With homogeneous TP, D pulls the whole kv cache from corresponding rank. With
@@ -2061,53 +2063,52 @@ class NixlBaseConnectorWorker:
             mamba = self._build_mamba_remote(nixl_agent_meta, tp_ratio, transfer_info)
             blocks_data = np.concatenate([blocks_data, mamba])
 
-        # Register with NIXL. A remote whose regions span memory types (e.g.
-        # a HiSparse DRAM host pool next to VRAM GPU pools) needs one dlist
-        # per type: a dlist is single-typed, and a DRAM descriptor validated
-        # against the remote's VRAM registrations is rejected by NIXL.
+        # Register with NIXL. NIXL descriptor lists are single memory type,
+        # so the remote's descriptors are split by its regions' memory
+        # types, one dlist per type: a DRAM descriptor validated against
+        # the remote's VRAM registrations is rejected by NIXL. Descriptor
+        # rows follow the remote's region order, region_num_blocks rows
+        # per region.
         remote_mem_types = nixl_agent_meta.region_mem_types
-        if remote_mem_types is not None and len(set(remote_mem_types)) > 1:
-            if self._has_mamba:
-                raise NotImplementedError(
-                    "Remote mixed-memory registration is not supported "
-                    "with Mamba layers."
-                )
-            # Descriptor rows follow the remote's region order, region_num_blocks
-            # rows per region.
-            typed_parts: dict[str, list[np.ndarray]] = {}
-            start = 0
-            for count, mem_type in zip(
-                self.dst_region_num_blocks[engine_id],
-                remote_mem_types,
-                strict=True,
-            ):
-                end = start + count
-                part = blocks_data[start:end]
-                if mem_type == "DRAM":
-                    # Host-memory descriptors use CPU device 0.
-                    part[:, 2] = 0
-                typed_parts.setdefault(mem_type, []).append(part)
-                start = end
-            assert start == len(blocks_data)
-            handles_by_mem_type: dict[str, int] = {}
-            primary_handle = None
-            for mem_type, parts in typed_parts.items():
-                descs = self.nixl_wrapper.get_xfer_descs(
-                    np.concatenate(parts), mem_type
-                )
-                handle = self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
-                handles_by_mem_type[mem_type] = handle
-                if primary_handle is None or mem_type != "DRAM":
-                    primary_handle = handle
-            self.dst_xfer_side_handles_by_mem_type.setdefault(engine_id, {})[
-                remote_tp_rank
-            ] = handles_by_mem_type
-            self.dst_xfer_side_handles[engine_id][remote_tp_rank] = primary_handle
-        else:
-            descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
-            self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
-                self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
+        if remote_mem_types is None:
+            raise NotImplementedError(
+                "Remote engine did not report per-region memory types; "
+                "the NIXL connector version handshake should have rejected "
+                "this peer."
             )
+        if self._has_mamba and len(set(remote_mem_types)) > 1:
+            raise NotImplementedError(
+                "Remote mixed-memory registration is not supported with Mamba layers."
+            )
+        typed_parts: dict[str, list[np.ndarray]] = {}
+        start = 0
+        for count, mem_type in zip(
+            self.dst_region_num_blocks[engine_id],
+            remote_mem_types,
+            strict=True,
+        ):
+            end = start + count
+            part = blocks_data[start:end]
+            if mem_type == "DRAM":
+                # Host-memory descriptors use CPU device 0.
+                part[:, 2] = 0
+            typed_parts.setdefault(mem_type, []).append(part)
+            start = end
+        if self._has_mamba:
+            # Mamba rows concatenate after the FA rows without region
+            # alignment; the remote is single-typed here, so they join the
+            # one dlist.
+            typed_parts[remote_mem_types[0]].append(blocks_data[start:])
+        else:
+            assert start == len(blocks_data)
+
+        handles: dict[str, int] = {}
+        for mem_type, parts in typed_parts.items():
+            descs = self.nixl_wrapper.get_xfer_descs(np.concatenate(parts), mem_type)
+            handles[mem_type] = self.nixl_wrapper.prep_xfer_dlist(
+                remote_agent_name, descs
+            )
+        self.dst_xfer_side_handles[engine_id][remote_tp_rank] = handles
 
         return remote_agent_name
 
@@ -3122,14 +3123,7 @@ class NixlBaseConnectorWorker:
         assert engine_id in self._remote_agents
 
         # Notif-only engines (push-mode D side) have no descriptor state.
-        # Mixed-memory remotes alias their primary (VRAM) dlist in both maps,
-        # so release each handle exactly once.
-        handles_by_mem_type = self.dst_xfer_side_handles_by_mem_type.pop(engine_id, {})
-        for rank, handle in self.dst_xfer_side_handles.pop(engine_id, {}).items():
-            if rank in handles_by_mem_type:
-                continue
-            self.nixl_wrapper.release_dlist_handle(handle)
-        for handles in handles_by_mem_type.values():
+        for handles in self.dst_xfer_side_handles.pop(engine_id, {}).values():
             for handle in handles.values():
                 self.nixl_wrapper.release_dlist_handle(handle)
         for agent_name in self._remote_agents.pop(engine_id).values():
@@ -3163,18 +3157,17 @@ class NixlBaseConnectorWorker:
     def _finish_shutdown(self) -> None:
         self._recving_transfers.clear()
         try:
-            for handle in self.src_xfer_handles_by_block_size.values():
-                self.nixl_wrapper.release_dlist_handle(handle)
-            for handles in self.src_xfer_handles_by_tp_ratio.values():
-                for handle in handles:
+            for handles in self.src_xfer_handles_by_block_size.values():
+                for handle in handles.values():
                     self.nixl_wrapper.release_dlist_handle(handle)
-            for handle in self._dram_src_handles_by_block_size.values():
-                self.nixl_wrapper.release_dlist_handle(handle)
+            for split_handles in self.src_xfer_handles_by_tp_ratio.values():
+                for handles in split_handles:
+                    for handle in handles.values():
+                        self.nixl_wrapper.release_dlist_handle(handle)
         except Exception:
             logger.exception("NIXL dlist-handle release failed at shutdown.")
         self.src_xfer_handles_by_block_size.clear()
         self.src_xfer_handles_by_tp_ratio.clear()
-        self._dram_src_handles_by_block_size.clear()
         try:
             for engine_id in list(self._remote_agents):
                 self._cleanup_remote_engine(engine_id, log_eviction=False)

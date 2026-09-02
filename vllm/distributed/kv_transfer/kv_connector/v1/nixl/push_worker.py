@@ -77,6 +77,20 @@ logger = init_logger(__name__)
 _PUSH_WRITER_POLL_INTERVAL_MS = 1.0
 
 
+def _single_type_handle(handles: dict[str, int], what: str) -> int:
+    """The one dlist handle of a single-memory-type registration.
+
+    Push WRITEs move whole block-id lists against one dlist per side, so
+    mixed-memory registrations have no single handle to target.
+    """
+    if len(handles) > 1:
+        raise NotImplementedError(
+            f"{what} spans memory types {sorted(handles)}; push transfers "
+            "only support single-memory-type registrations."
+        )
+    return next(iter(handles.values()))
+
+
 class NixlPushConnectorWorker(NixlBaseConnectorWorker):
     """Push-specific (WRITE) worker logic. See module docstring."""
 
@@ -579,13 +593,11 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 # Hybrid MLA+SSM also lands here: its split handles replicate
                 # the attention descriptors and chunk only the SSM state.
                 split_key = (tp_ratio, remote_block_size)
-                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[split_key][i]
+                local_handles = self.src_xfer_handles_by_tp_ratio[split_key][i]
             else:
-                local_xfer_side_handle = self.src_xfer_handles_by_block_size[
-                    remote_block_size
-                ]
+                local_handles = self.src_xfer_handles_by_block_size[remote_block_size]
 
-            remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][
+            remote_handles = self.dst_xfer_side_handles[meta.remote.engine_id][
                 spec.remote_rank
             ]
 
@@ -594,8 +606,12 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 request_id=req_id,
                 dst_engine_id=meta.remote.engine_id,
                 remote_request_id=meta.remote.request_id,
-                local_xfer_side_handle=local_xfer_side_handle,
-                remote_xfer_side_handle=remote_xfer_side_handle,
+                local_xfer_side_handle=_single_type_handle(
+                    local_handles, "local push registration"
+                ),
+                remote_xfer_side_handle=_single_type_handle(
+                    remote_handles, "remote push registration"
+                ),
             )
             if handle is not None:
                 handles.append(handle)

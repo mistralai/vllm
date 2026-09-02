@@ -7,8 +7,9 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
+from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, EngineTransferInfo
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+    _SHARED_REGION_GROUP_ID,
     NixlBaseConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
@@ -228,16 +229,14 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 # Remote tp_size > local tp_size: we must perform multiple
                 # reads. Get the memory chunk onto which we will write to.
                 split_key = (tp_ratio, remote_block_size)
-                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[split_key][i]
+                local_handles = self.src_xfer_handles_by_tp_ratio[split_key][i]
             else:
                 # Single read from remote, we write to the whole memory region.
                 # Also handle remote block size different from local block size.
-                local_xfer_side_handle = self.src_xfer_handles_by_block_size[
-                    remote_block_size
-                ]
+                local_handles = self.src_xfer_handles_by_block_size[remote_block_size]
 
-            # Destination handle: remote_engine_id -> remote_rank -> handle.
-            remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][
+            # Destination handles: remote_engine_id -> remote_rank -> handles.
+            remote_handles = self.dst_xfer_side_handles[meta.remote.engine_id][
                 spec.remote_rank
             ]
 
@@ -249,8 +248,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 request_id=req_id,
                 dst_engine_id=meta.remote.engine_id,
                 remote_request_id=meta.remote.request_id,
-                local_xfer_side_handle=local_xfer_side_handle,
-                remote_xfer_side_handle=remote_xfer_side_handle,
+                local_handles=local_handles,
+                remote_handles=remote_handles,
             ):
                 return
 
@@ -269,8 +268,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         dst_engine_id: str,
         request_id: str,
         remote_request_id: str,
-        local_xfer_side_handle: int,
-        remote_xfer_side_handle: int,
+        local_handles: dict[str, int],
+        remote_handles: dict[str, int],
     ) -> bool:
         """
         Post a READ point-to-point xfer request from a single local worker to
@@ -359,108 +358,22 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # corresponding rank. With heterogeneous TP, fixing D>P, the D tp
         # workers will issue xfers to parts of the P worker remote kv caches.
 
-        # Region-group layout of the local side; entries of the block-id
-        # lists are regions for region-mapped specs, cache groups otherwise.
-        local_region_group_ids = (
-            list(range(self.num_regions))
-            if read_spec.block_ids_by_region
-            else (self.region_group_ids or None)
-        )
-
-        # Get descs ids.
-        remote_block_descs_ids = self._compute_desc_ids(
-            block_ids=remote_block_ids,
-            dst_num_blocks=self.dst_num_blocks[dst_engine_id],
-            block_size_ratio=None,
-            physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
-            region_num_blocks=(self.dst_region_num_blocks.get(dst_engine_id) or None),
-            region_group_ids=(
-                list(range(self.num_regions))
-                if read_spec.block_ids_by_region
-                else (self.dst_region_group_ids.get(dst_engine_id) or None)
-            ),
-        )
-
-        if self._mixed_mem_types:
-            # Mixed-memory registrations span several descriptor lists, so
-            # one READ is posted per memory type; the flat local descriptor
-            # ids below are never used.
-            handle = None
-            try:
-                self._read_blocks_by_mem_type(
-                    read_spec=read_spec,
-                    request_id=request_id,
-                    dst_engine_id=dst_engine_id,
-                    remote_block_descs_ids=remote_block_descs_ids,
-                    local_region_group_ids=local_region_group_ids,
-                    local_vram_handle=local_xfer_side_handle,
-                    remote_xfer_side_handle=remote_xfer_side_handle,
-                    block_size_ratio=block_size_ratio,
-                    local_block_size_key=remote_info.remote_block_size,
-                    notif_id=notif_id,
-                )
-                return True
-            except Exception as e:
-                # mark all (logical) blocks for this request as invalid
-                self._log_failure(
-                    failure_type="transfer_setup_failed",
-                    req_id=request_id,
-                    msg="Marking blocks as invalid",
-                    error=e,
-                    dst_engine_id=dst_engine_id,
-                    remote_rank=remote_rank,
-                )
-                self._handle_failed_transfer(request_id, handle)
-                return False
-
-        if self.dst_xfer_side_handles_by_mem_type.get(dst_engine_id, {}).get(
-            remote_rank
-        ):
-            # The remote spans memory types while this side does not: its
-            # descriptor lists are split by type and cannot be addressed with
-            # one flat dlist.
-            self._log_failure(
-                failure_type="transfer_setup_failed",
-                req_id=request_id,
-                msg="Marking blocks as invalid",
-                error=NotImplementedError(
-                    "Reading a mixed-memory remote from a single-memory-type "
-                    "local registration is not supported."
-                ),
-                dst_engine_id=dst_engine_id,
-                remote_rank=remote_rank,
-            )
-            self._handle_failed_transfer(request_id, None)
-            return False
-
-        local_block_descs_ids = self._compute_desc_ids(
-            block_ids=local_block_ids,
-            dst_num_blocks=self.dst_num_blocks[self.engine_id],
-            block_size_ratio=block_size_ratio,
-            physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
-            region_num_blocks=(self.dst_region_num_blocks.get(self.engine_id) or None),
-            region_group_ids=local_region_group_ids,
-        )
-
-        assert len(local_block_descs_ids) == len(remote_block_descs_ids)
-
-        # Prepare transfer with Nixl.
-        handle = None
+        # Both sides' descriptor lists are split by memory type, so reads
+        # are posted per (local, remote) type pair; a single-type pairing
+        # degenerates to one READ.
         try:
-            handle = self.nixl_wrapper.make_prepped_xfer(
-                "READ",
-                local_xfer_side_handle,
-                local_block_descs_ids,
-                remote_xfer_side_handle,
-                remote_block_descs_ids,
-                notif_msg=notif_id,
+            self._read_blocks_by_mem_type(
+                read_spec=read_spec,
+                request_id=request_id,
+                dst_engine_id=dst_engine_id,
+                local_block_ids=local_block_ids,
+                remote_block_ids=remote_block_ids,
+                local_handles=local_handles,
+                remote_handles=remote_handles,
+                block_size_ratio=block_size_ratio,
+                remote_info=remote_info,
+                notif_id=notif_id,
             )
-
-            # Begin async xfer.
-            self.nixl_wrapper.transfer(handle)
-
-            # Use handle to check completion in future step().
-            self._recving_transfers[request_id].append(handle)
             return True
         except Exception as e:
             # mark all (logical) blocks for this request as invalid
@@ -472,7 +385,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 dst_engine_id=dst_engine_id,
                 remote_rank=remote_rank,
             )
-            self._handle_failed_transfer(request_id, handle)
+            self._handle_failed_transfer(request_id, None)
             return False
 
     def _read_blocks_by_mem_type(
@@ -480,75 +393,64 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         read_spec: ReadSpec,
         request_id: str,
         dst_engine_id: str,
-        remote_block_descs_ids: np.ndarray,
-        local_region_group_ids: list[int] | None,
-        local_vram_handle: int,
-        remote_xfer_side_handle: int,
+        local_block_ids: BlockIds,
+        remote_block_ids: BlockIds,
+        local_handles: dict[str, int],
+        remote_handles: dict[str, int],
         block_size_ratio: int | None,
-        local_block_size_key: int,
+        remote_info: EngineTransferInfo,
         notif_id: bytes,
     ) -> None:
-        """Post one READ per memory type over a mixed-memory registration.
+        """Post one READ per (local, remote) memory-type pair.
 
-        Local descriptor lists are split by memory type at registration, so
-        descriptor ids are computed per partition while the remote side keeps
-        its flat ids, sliced at the partitions' entry segments. A remote that
-        also spans memory types (e.g. a HiSparse DRAM host pool) splits its
-        dlists by type too, so each local partition is further paired by the
-        remote regions' type. P is freed only once every partition's READ
-        completes, hence the deferred notification.
+        Both sides split their descriptor lists by memory type at
+        registration, so block-id entries are paired by their regions'
+        types and each pair reads against its own dlists. A remote entry
+        may pair with a different type than its local partition's, hence
+        the nested grouping. P is freed only once every READ completes,
+        hence the deferred notification when more than one READ is posted;
+        a single READ carries its notification inline.
         """
-        local_block_ids = read_spec.local_block_ids
-        region_group_ids = local_region_group_ids
+        # Region-group layout of the local side; entries of the block-id
+        # lists are regions for region-mapped specs, cache groups otherwise.
+        region_group_ids = (
+            list(range(self.num_regions))
+            if read_spec.block_ids_by_region
+            else (self.region_group_ids or None)
+        )
         if region_group_ids is None:
             region_group_ids = self.region_group_ids
         if not region_group_ids and self.num_regions == 1:
             region_group_ids = [0]
-        group_arr = np.asarray(region_group_ids)
-        partitions = self._mem_type_partitions(region_group_ids, len(local_block_ids))
-
-        # Flat local and remote descriptor ids pair positionally, so each
-        # entry owns a contiguous segment of both arrays.
-        segments: list[slice] = []
-        start = 0
-        for entry, blocks in enumerate(local_block_ids):
-            length = len(blocks) * int((group_arr == entry).sum())
-            segments.append(slice(start, start + length))
-            start += length
-        assert start == len(remote_block_descs_ids)
-
-        remote_handles_by_mem_type = self.dst_xfer_side_handles_by_mem_type.get(
-            dst_engine_id, {}
-        ).get(read_spec.remote_rank)
         region_mapped = bool(read_spec.block_ids_by_region)
+        partitions = self._mem_type_partitions(region_group_ids, len(local_block_ids))
 
         reads: list[tuple[int, np.ndarray, int, np.ndarray]] = []
         for mem_type, entries in partitions.items():
-            # Entries of one local memory type may pair with remote regions of
-            # different types; each (local, remote) type pair reads against its
-            # own pair of dlists.
-            by_remote_type: dict[str | None, list[int]] = {}
+            local_handle = local_handles.get(mem_type)
+            if local_handle is None:
+                raise NotImplementedError(
+                    f"Local registration has no {mem_type} descriptors for "
+                    f"the regions paired with block-id entries {entries}; "
+                    "a mixed-memory remote needs a matching local pool."
+                )
+            # Entries of one local memory type may pair with remote regions
+            # of different types; each (local, remote) type pair reads
+            # against its own pair of dlists.
+            by_remote_type: dict[str, list[int]] = {}
             for entry in entries:
                 remote_mem_type = self._remote_entry_mem_type(
                     dst_engine_id, entry, region_mapped
                 )
-                if (
-                    remote_handles_by_mem_type is not None
-                    and remote_mem_type not in remote_handles_by_mem_type
-                ):
-                    raise RuntimeError(
-                        f"No remote dlist for entry {entry} memory type "
-                        f"{remote_mem_type}; available: "
-                        f"{sorted(remote_handles_by_mem_type)}."
-                    )
                 by_remote_type.setdefault(remote_mem_type, []).append(entry)
 
             for remote_mem_type, typed_entries in by_remote_type.items():
-                remote_handle = (
-                    remote_handles_by_mem_type[remote_mem_type]
-                    if remote_handles_by_mem_type is not None
-                    else remote_xfer_side_handle
-                )
+                remote_handle = remote_handles.get(remote_mem_type)
+                if remote_handle is None:
+                    raise NotImplementedError(
+                        f"Remote registration has no {remote_mem_type} "
+                        f"descriptors for block-id entries {typed_entries}."
+                    )
                 # The local dlist for mem_type holds every local region of
                 # that type in region order, so ids are computed over the
                 # full set; regions of entries outside typed_entries occupy
@@ -568,39 +470,38 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     ),
                     region_num_blocks=[self.region_num_blocks[r] for r in type_regions],
                     region_group_ids=[
-                        entry_pos.get(region_group_ids[r], len(typed_entries))
+                        _SHARED_REGION_GROUP_ID
+                        if region_group_ids[r] == _SHARED_REGION_GROUP_ID
+                        else entry_pos.get(region_group_ids[r], len(typed_entries))
                         for r in type_regions
                     ],
                 )
                 if len(local_ids) == 0:
                     continue
-                if remote_handles_by_mem_type is not None:
-                    # The remote dlist for this type holds that type's regions
-                    # in region order, so ids are computed against it rather
-                    # than sliced from the flat region-major sequence.
-                    remote_ids = self._remote_desc_ids_for_type(
-                        dst_engine_id=dst_engine_id,
-                        mem_type=remote_mem_type,
-                        entries=typed_entries,
-                        region_mapped=region_mapped,
-                        remote_block_ids=read_spec.remote_block_ids,
-                    )
-                else:
-                    remote_ids = np.concatenate(
-                        [remote_block_descs_ids[segments[i]] for i in typed_entries]
-                    )
+                remote_ids = self._remote_desc_ids_for_type(
+                    dst_engine_id=dst_engine_id,
+                    mem_type=remote_mem_type,
+                    entries=typed_entries,
+                    region_mapped=region_mapped,
+                    remote_block_ids=remote_block_ids,
+                    remote_info=remote_info,
+                )
                 assert len(local_ids) == len(remote_ids)
-                if mem_type == "DRAM":
-                    local_handle = self._dram_src_handles_by_block_size[
-                        local_block_size_key
-                    ]
-                else:
-                    local_handle = local_vram_handle
                 reads.append((local_handle, local_ids, remote_handle, remote_ids))
+
+        if not reads:
+            # Every group's blocks were trimmed away (prefix cache hit): the
+            # empty READ this degenerates to only carried the notification.
+            agent_name = self._remote_agents[dst_engine_id][(0, read_spec.remote_rank)]
+            self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
+            return
 
         prepped: list[int] = []
         try:
             for local_handle, local_ids, remote_handle, remote_ids in reads:
+                # A single READ notifies P through NIXL on completion, like
+                # the single-dlist transfer it replaces.
+                notif_msg = notif_id if len(reads) == 1 else None
                 prepped.append(
                     self.nixl_wrapper.make_prepped_xfer(
                         "READ",
@@ -608,6 +509,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         local_ids,
                         remote_handle,
                         remote_ids,
+                        notif_msg=notif_msg,
                     )
                 )
         except Exception:
@@ -615,14 +517,19 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 self.nixl_wrapper.release_xfer_handle(handle)
             raise
 
-        notif_agent = self._remote_agents[dst_engine_id][(0, read_spec.remote_rank)]
-        self._pending_recv_notifs.setdefault(request_id, []).append(
-            (notif_agent, notif_id)
-        )
+        if len(reads) > 1:
+            # P is freed once every READ completes, so the notification is
+            # deferred until the request's transfers finish.
+            notif_agent = self._remote_agents[dst_engine_id][(0, read_spec.remote_rank)]
+            self._pending_recv_notifs.setdefault(request_id, []).append(
+                (notif_agent, notif_id)
+            )
         for i, handle in enumerate(prepped):
             try:
                 self.nixl_wrapper.transfer(handle)
             except Exception:
+                # Started handles stay tracked and are drained by the
+                # deferred failure path; release the ones never started.
                 for unstarted in prepped[i:]:
                     self.nixl_wrapper.release_xfer_handle(unstarted)
                 raise
@@ -630,28 +537,29 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
     def _remote_entry_mem_type(
         self, dst_engine_id: str, entry: int, region_mapped: bool
-    ) -> str | None:
+    ) -> str:
         """Memory type of the remote regions paired with a block-id entry.
 
         Entries are regions for region-mapped specs and cache groups
-        otherwise; the remote side uses the same layout. Returns None when
-        the remote did not report per-region memory types or the entry spans
-        several.
+        otherwise; the remote side uses the same layout. Regions shared
+        across groups pair with every entry, mirroring the local
+        ``_mem_type_partitions`` rule that an entry spans one memory type.
         """
-        dst_mem_types = self.dst_region_mem_types.get(dst_engine_id)
-        if not dst_mem_types:
-            return None
+        dst_mem_types = self.dst_region_mem_types[dst_engine_id]
         if region_mapped:
-            return dst_mem_types[entry] if entry < len(dst_mem_types) else None
-        dst_group_ids = self.dst_region_group_ids.get(dst_engine_id)
-        if not dst_group_ids or len(dst_group_ids) != len(dst_mem_types):
-            return None
+            return dst_mem_types[entry]
+        dst_group_ids = self.dst_region_group_ids[dst_engine_id]
         types = {
             dst_mem_types[r]
             for r in range(len(dst_mem_types))
-            if dst_group_ids[r] == entry
+            if dst_group_ids[r] == entry or dst_group_ids[r] == _SHARED_REGION_GROUP_ID
         }
-        return types.pop() if len(types) == 1 else None
+        if len(types) != 1:
+            raise NotImplementedError(
+                f"Remote block-id entry {entry} pairs with regions of memory "
+                f"types {sorted(types)}; transfers need single-type entries."
+            )
+        return types.pop()
 
     def _remote_desc_ids_for_type(
         self,
@@ -660,19 +568,19 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         entries: list[int],
         region_mapped: bool,
         remote_block_ids: BlockIds,
+        remote_info: EngineTransferInfo,
     ) -> np.ndarray:
         """Descriptor ids into a remote dlist holding one memory type.
 
         The dlist concatenates the remote regions of ``mem_type`` in region
         order, so ids are computed over that region subset. Regions of
         entries outside ``entries`` still occupy dlist slots but contribute
-        no ids; a sentinel group id keeps them out of the block-id lookup.
+        no ids; a sentinel group id keeps them out of the block-id lookup,
+        while regions shared across groups pair with every entry.
         """
-        assert self.transfer_topo is not None
-        remote_info = self.transfer_topo.get_engine_info(dst_engine_id)
-        dst_mem_types = self.dst_region_mem_types.get(dst_engine_id, [])
-        dst_region_num_blocks = self.dst_region_num_blocks.get(dst_engine_id, [])
-        dst_group_ids = self.dst_region_group_ids.get(dst_engine_id, [])
+        dst_mem_types = self.dst_region_mem_types[dst_engine_id]
+        dst_region_num_blocks = self.dst_region_num_blocks[dst_engine_id]
+        dst_group_ids = self.dst_region_group_ids[dst_engine_id]
         entry_index = {entry: pos for pos, entry in enumerate(entries)}
         region_num_blocks: list[int] = []
         region_group_ids: list[int] = []
@@ -681,7 +589,11 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 continue
             region_num_blocks.append(dst_region_num_blocks[r])
             group = r if region_mapped else dst_group_ids[r]
-            region_group_ids.append(entry_index.get(group, len(entries)))
+            region_group_ids.append(
+                _SHARED_REGION_GROUP_ID
+                if group == _SHARED_REGION_GROUP_ID
+                else entry_index.get(group, len(entries))
+            )
         return self._compute_desc_ids(
             block_ids=[remote_block_ids[i] for i in entries],
             dst_num_blocks=self.dst_num_blocks[dst_engine_id],
