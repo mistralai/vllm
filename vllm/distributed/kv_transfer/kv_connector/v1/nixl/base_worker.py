@@ -92,6 +92,7 @@ from vllm.v1.worker.utils import select_common_block_size
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.distributed.nixl_utils import nixlXferTelemetry
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
@@ -593,6 +594,9 @@ class NixlBaseConnectorWorker:
         # [req_id -> list[handle]]
         self._recving_metadata: dict[ReqId, ReqMeta] = {}
         self._recving_transfers = defaultdict[ReqId, list[TransferHandle]](list)
+        # (local, remote) memory-type pair per posted READ, for per-transfer
+        # timing logs; tagged by the pull worker at transfer time.
+        self._recv_xfer_mem_types: dict[TransferHandle, tuple[str, str]] = {}
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
         # Set of requests that have been part of a batch, regardless of status.
@@ -2714,6 +2718,7 @@ class NixlBaseConnectorWorker:
                         # Get telemetry from NIXL
                         res = self.nixl_wrapper.get_xfer_telemetry(handle)
                         self.xfer_stats.record_transfer(res)
+                        self._log_read_split(handle, res)
                         self.nixl_wrapper.release_xfer_handle(handle)
                     elif xfer_state == "PROC":
                         in_progress.append(handle)
@@ -2761,6 +2766,23 @@ class NixlBaseConnectorWorker:
             if is_recv:
                 self._send_pending_recv_notifs(req_id)
         return done_req_ids
+
+    def _log_read_split(self, handle: TransferHandle, res: "nixlXferTelemetry") -> None:
+        """Log one line per completed READ with its memory-type pairing."""
+        mem_pair = self._recv_xfer_mem_types.pop(handle, None)
+        if mem_pair is None:
+            return
+        local_mem, remote_mem = mem_pair
+        duration_us = max(res.xferDuration, 1)
+        logger.info(
+            "NIXL READ %s<-%s: %.1f ms, %.1f MB, %d descs, %.1f GB/s",
+            local_mem,
+            remote_mem,
+            res.xferDuration / 1e3,
+            res.totalBytes / 2**20,
+            res.descCount,
+            res.totalBytes / duration_us / 1e3,
+        )
 
     def _send_pending_recv_notifs(self, req_id: str) -> None:
         """Send notifications deferred by split DRAM/VRAM reads."""
@@ -3156,6 +3178,7 @@ class NixlBaseConnectorWorker:
 
     def _finish_shutdown(self) -> None:
         self._recving_transfers.clear()
+        self._recv_xfer_mem_types.clear()
         try:
             for handles in self.src_xfer_handles_by_block_size.values():
                 for handle in handles.values():

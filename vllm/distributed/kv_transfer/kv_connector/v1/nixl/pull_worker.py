@@ -425,7 +425,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         region_mapped = bool(read_spec.block_ids_by_region)
         partitions = self._mem_type_partitions(region_group_ids, len(local_block_ids))
 
-        reads: list[tuple[int, np.ndarray, int, np.ndarray]] = []
+        # (local handle, local ids, remote handle, remote ids, type pair).
+        reads: list[tuple[int, np.ndarray, int, np.ndarray, tuple[str, str]]] = []
         for mem_type, entries in partitions.items():
             local_handle = local_handles.get(mem_type)
             if local_handle is None:
@@ -487,7 +488,15 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     remote_info=remote_info,
                 )
                 assert len(local_ids) == len(remote_ids)
-                reads.append((local_handle, local_ids, remote_handle, remote_ids))
+                reads.append(
+                    (
+                        local_handle,
+                        local_ids,
+                        remote_handle,
+                        remote_ids,
+                        (mem_type, remote_mem_type),
+                    )
+                )
 
         if not reads:
             # Every group's blocks were trimmed away (prefix cache hit): the
@@ -498,7 +507,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
         prepped: list[int] = []
         try:
-            for local_handle, local_ids, remote_handle, remote_ids in reads:
+            for local_handle, local_ids, remote_handle, remote_ids, _ in reads:
                 # A single READ notifies P through NIXL on completion, like
                 # the single-dlist transfer it replaces.
                 notif_msg = notif_id if len(reads) == 1 else None
@@ -524,7 +533,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             self._pending_recv_notifs.setdefault(request_id, []).append(
                 (notif_agent, notif_id)
             )
-        for i, handle in enumerate(prepped):
+        for i, (handle, read) in enumerate(zip(prepped, reads)):
             try:
                 self.nixl_wrapper.transfer(handle)
             except Exception:
@@ -534,6 +543,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     self.nixl_wrapper.release_xfer_handle(unstarted)
                 raise
             self._recving_transfers[request_id].append(handle)
+            self._recv_xfer_mem_types[handle] = read[-1]
 
     def _remote_entry_mem_type(
         self, dst_engine_id: str, entry: int, region_mapped: bool
