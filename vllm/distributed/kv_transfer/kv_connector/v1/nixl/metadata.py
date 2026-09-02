@@ -46,8 +46,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #   8: Add dcp_size and pcp_size to NixlAgentMetadata
 #   9: Add block_strides
 #  10: Add per-region transfer geometry to NixlAgentMetadata
+#  11: Add per-region memory types to NixlAgentMetadata
 #
-NIXL_CONNECTOR_VERSION: int = 10
+NIXL_CONNECTOR_VERSION: int = 11
 
 
 @dataclass
@@ -67,6 +68,7 @@ class NixlAgentMetadata:
     region_num_blocks: list[int] | None = None
     region_group_ids: list[int] | None = None
     region_names: list[str] | None = None
+    region_mem_types: list[str] | None = None
     dcp_size: int = 1
     pcp_size: int = 1
 
