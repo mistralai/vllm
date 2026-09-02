@@ -1168,6 +1168,11 @@ class NixlBaseConnectorWorker:
 
         candidate_storages = set(by_storage)
         for name, view in xfer_buffers.items():
+            if name not in self._layer_specs:
+                # Non-transferable views (e.g. HiSparse resident/hot overlays)
+                # are skipped at registration, so they cannot claim the
+                # slice's bytes.
+                continue
             config = tensor_configs.get(name)
             if config is not None and id(config) in candidates:
                 continue
