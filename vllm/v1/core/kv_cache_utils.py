@@ -1562,8 +1562,10 @@ def _get_hisparse_hma_config(
         *gpu_other_regular_groups,
     ]
     gpu_stride = _get_kv_cache_bytes_per_block(gpu_groups)
+    # Indexer pages get their own tensor covering a contiguous slice of every
+    # GPU block row; resident/hot groups overlay the remaining row bytes.
     gpu_layers_by_offset: defaultdict[int, list[str]] = defaultdict(list)
-    for gpu_group in gpu_groups:
+    for gpu_group in [*resident_groups, *hot_groups, *gpu_other_regular_groups]:
         byte_offset = 0
         for layer_name in gpu_group.layer_names:
             gpu_layers_by_offset[byte_offset].append(layer_name)
@@ -1584,18 +1586,44 @@ def _get_hisparse_hma_config(
             f"host={host_num_blocks}, gpu={gpu_num_blocks}."
         )
 
+    host_pages = {spec.page_size_bytes for spec in host_specs.values()}
+    if len(host_pages) != 1:
+        raise ValueError(
+            "HiSparse host pool requires one page size across host-resident "
+            f"layers, got {sorted(host_pages)}."
+        )
+    host_layer_page = host_pages.pop()
+    # One block-major host tensor: every block row packs all host layers, each
+    # layer owning a contiguous page slice. P registers the matching slice, so
+    # one NIXL descriptor moves one whole host block.
     tensors = [
         KVCacheTensor(
-            size=spec.page_size_bytes * host_num_blocks,
-            layers=[name],
-            layer_stride=spec.page_size_bytes * host_num_blocks,
-            block_stride=spec.page_size_bytes,
+            size=host_page * host_num_blocks,
+            layers=list(host_specs),
+            layer_stride=host_layer_page,
+            block_stride=host_page,
+            offset=0,
             host_resident=True,
             block_pool_id=None,
         )
-        for name, spec in host_specs.items()
     ]
     gpu_size = gpu_stride * gpu_num_blocks
+    indexer_pages = {spec.page_size_bytes for spec in gpu_indexer_specs.values()}
+    if len(indexer_pages) != 1:
+        raise ValueError(
+            "HiSparse GPU indexer layers require one page size, got "
+            f"{sorted(indexer_pages)}."
+        )
+    tensors.append(
+        KVCacheTensor(
+            size=gpu_size,
+            layers=list(gpu_indexer_specs),
+            layer_stride=indexer_pages.pop(),
+            offset=0,
+            block_stride=gpu_stride,
+            block_pool_id=0,
+        )
+    )
     tensors.extend(
         KVCacheTensor(
             size=gpu_size,
@@ -2627,8 +2655,6 @@ def get_kv_cache_configs(
                 )
                 assert tensor.size % old_blocks == 0
                 tensor.size = tensor.size // old_blocks * new_blocks
-                if tensor.host_resident:
-                    tensor.layer_stride = tensor.size
     else:
         min_num_blocks = min(config.num_blocks for config in kv_cache_configs)
         for i, config in enumerate(kv_cache_configs):

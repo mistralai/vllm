@@ -256,7 +256,7 @@ def _allocate_hisparse_kv_cache(
                 assert backing.numel() == tensor.size
             num_blocks = kv_cache_config.num_blocks_by_pool[tensor.block_pool_id]
 
-        for layer_name in tensor.layers:
+        for layer_idx, layer_name in enumerate(tensor.layers):
             group_id, group = next(
                 (group_id, group)
                 for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
@@ -268,10 +268,13 @@ def _allocate_hisparse_kv_cache(
             raw_tensors[layer_name] = backing
             if isinstance(spec, (HiSparseHotSpec, HiSparseResidentSpec)):
                 continue
+            # A block-major tensor shifts each layer's slice by one page;
+            # layer_stride == 0 marks HMA overlays that alias the same bytes.
             layer_tensor = replace(
                 tensor,
                 layers=[layer_name],
                 layer_stride=tensor.layer_stride or tensor.size,
+                offset=tensor.offset + layer_idx * tensor.layer_stride,
             )
             (kv_cache,) = create_kv_cache_views(
                 backing,

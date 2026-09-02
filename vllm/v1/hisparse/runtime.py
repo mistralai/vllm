@@ -187,18 +187,21 @@ def release_pinned_state(
 
     for runtime in runtimes:
         del runtime._host_cache
+        del runtime._host_pool_flat
         del runtime.registered_host_pool
         del runtime.hot_backing
 
 
 def hisparse_prefill_staging_remap(
-    block_table: torch.Tensor, block_size: int
+    block_table: torch.Tensor,
+    block_size: int,
+    row_multiplier: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Renumber a block table against its unique referenced blocks."""
     unique_ids, inverse = torch.unique(block_table.clamp(min=0), return_inverse=True)
     new_bt = inverse.to(torch.int32)
     row_ids = (
-        unique_ids.to(torch.int32).unsqueeze(1) * block_size
+        unique_ids.to(torch.int32).unsqueeze(1) * (block_size * row_multiplier)
         + torch.arange(block_size, dtype=torch.int32, device=block_table.device)
     ).view(1, -1)
     return new_bt, row_ids
@@ -217,6 +220,7 @@ def build_hisparse_prefill_staging_plan(
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     block_size: int,
+    row_multiplier: int = 1,
 ) -> HiSparsePrefillStagingPlan:
     """Build the layer-independent remap for host-cache prefill staging."""
     device = block_table.device
@@ -226,7 +230,9 @@ def build_hisparse_prefill_staging_plan(
         block_table,
         0,
     )
-    new_bt, row_ids = hisparse_prefill_staging_remap(bounded, block_size)
+    new_bt, row_ids = hisparse_prefill_staging_remap(
+        bounded, block_size, row_multiplier
+    )
     dst_rows = torch.arange(row_ids.shape[1], dtype=torch.int32, device=device).view(
         1, -1
     )
@@ -316,6 +322,7 @@ class HiSparseRuntime:
     hot_backing: torch.Tensor
     hot_block_table: torch.Tensor
     _host_cache: torch.Tensor
+    _host_pool_flat: torch.Tensor
     registered_host_pool: torch.Tensor
 
     def __init__(
@@ -367,6 +374,10 @@ class HiSparseRuntime:
         self.eager_host_mirror = False
         self.resident_source_index = -1
         self.request_state_indices: torch.Tensor | None = None
+        # Block-major host-pool geometry, set by bind_source_cache.
+        self.host_block_multiplier = 1
+        self.host_layer_offset_bytes = 0
+        self._host_block_size = 0
 
     @property
     def host_cache(self) -> torch.Tensor:
@@ -420,11 +431,51 @@ class HiSparseRuntime:
         # allocator explicitly registered.
         if not (kv_cache.is_pinned() or registered_host_pool is not None):
             raise ValueError("HiSparse host-resident KV pool must be pinned memory.")
+        assert registered_host_pool is not None
+        pool = registered_host_pool
 
-        self._host_cache = kv_cache.view(-1, kv_cache.shape[-1])
-        self.registered_host_pool = (
-            registered_host_pool if registered_host_pool is not None else kv_cache
+        # Block-major pool: every block row packs this group's L layers, layer
+        # l holding rows [l*bs, (l+1)*bs) of the row. Kernels keep flat row
+        # addressing through a per-layer suffix view: row (block b, token n)
+        # of layer l is suffix row b*L*bs + n.
+        itemsize = kv_cache.element_size()
+        row_bytes = self.row_width * itemsize
+        block_size = kv_cache.shape[-2]
+        block_stride_rows = kv_cache.stride(0) * itemsize // row_bytes
+        layer_offset_bytes = kv_cache.data_ptr() - pool.data_ptr()
+        layer_offset_rows = layer_offset_bytes // row_bytes
+        if (
+            kv_cache.stride(0) * itemsize % row_bytes
+            or layer_offset_bytes % row_bytes
+            or block_stride_rows % block_size
+            or layer_offset_rows % block_size
+        ):
+            raise ValueError(
+                "HiSparse host pool rows are not block-aligned: layer offset "
+                f"{layer_offset_bytes}B, block stride "
+                f"{kv_cache.stride(0) * itemsize}B, row {row_bytes}B."
+            )
+        self.host_block_multiplier = block_stride_rows // block_size
+        self.host_layer_offset_bytes = layer_offset_bytes
+        self._host_block_size = block_size
+
+        flat = pool.view(self.kv_dtype)
+        usable_rows = flat.numel() // self.row_width
+        self._host_pool_flat = flat[: usable_rows * self.row_width].view(
+            -1, self.row_width
         )
+        self._host_cache = self._host_pool_flat.narrow(
+            0, layer_offset_rows, usable_rows - layer_offset_rows
+        )
+        self.registered_host_pool = pool
+
+    def remap_host_slots(self, slots: torch.Tensor) -> torch.Tensor:
+        """Lift per-layer slots (b*bs + n) to block-major suffix rows."""
+        multiplier = self.host_block_multiplier
+        if multiplier == 1:
+            return slots
+        block_size = self._host_block_size
+        return slots + (slots // block_size) * ((multiplier - 1) * block_size)
 
     def stage_prefill_cache(
         self,
@@ -440,6 +491,7 @@ class HiSparseRuntime:
             block_table,
             seq_lens,
             block_size,
+            row_multiplier=self.host_block_multiplier,
         )
         return self.gather_prefill_cache(kv_cache, plan), plan.block_table
 
@@ -465,8 +517,10 @@ class HiSparseRuntime:
             dtype=kv_cache.dtype,
             device=plan.block_table.device,
         )
+        # Row ids address the block-major suffix view, not the strided
+        # per-layer cache, so the gather reads whole contiguous rows.
         torch.ops._C_cache_ops.hisparse_gather_plan(
-            kv_cache.view(-1, row_width),
+            self._host_cache,
             staged,
             plan.row_ids,
             plan.dst_rows,
@@ -529,7 +583,7 @@ class HiSparseRuntime:
         self,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the static tensors needed by the all-layer backup plan."""
-        return self.hot.cache, self.host_cache
+        return self.hot.cache, self._host_pool_flat
 
     def swap_in(
         self,
@@ -569,6 +623,11 @@ class HiSparseRuntime:
             compact_miss_counts = None
 
         attention_indices = plan.attention_indices[plan_rows]
+
+        # The host pool is block-major: scale logical block ids so the kernel's
+        # g = physical_block * block_size + offset lands on suffix rows.
+        if self.host_block_multiplier != 1:
+            block_table = block_table * self.host_block_multiplier
 
         # Padded rows are skipped by the kernel (request_state_indices) and must
         # come out as -1 so the attention kernel masks them.
@@ -732,6 +791,9 @@ class HiSparseCacheHandle:
                 .to(device=self.runtime.device, dtype=torch.int64)
                 .contiguous()
             )
+            # Host globals live in block-major suffix space, so lift the
+            # logical slots before backing up and invalidating them.
+            mirrored_slots = self.runtime.remap_host_slots(mirrored_slots)
             self.runtime.backup_rows(
                 self.view.cache,
                 resident_slots,

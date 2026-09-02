@@ -1671,6 +1671,13 @@ class MooncakeStoreWorker:
                     tensor_config is not None and tensor_config.host_resident
                 )
                 if is_host_resident:
+                    assert tensor_config is not None
+                    if len(tensor_config.layers) > 1:
+                        raise ValueError(
+                            "Mooncake store does not support block-major "
+                            "host-resident KV pools spanning multiple layers "
+                            f"({len(tensor_config.layers)} in {layer_name})."
+                        )
                     num_blocks = self._kv_cache_config.hisparse_host_num_blocks
                     assert num_blocks is not None
                 else:

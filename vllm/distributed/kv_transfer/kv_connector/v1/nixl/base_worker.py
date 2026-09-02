@@ -80,6 +80,8 @@ from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheLayout,
+    KVCacheSpec,
+    KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -1087,6 +1089,85 @@ class NixlBaseConnectorWorker:
 
         fut.add_done_callback(request_ready)
 
+    def _tensor_slice_regions(
+        self,
+        xfer_buffers: dict[str, torch.Tensor],
+        tensor_configs: dict[str, KVCacheTensor],
+    ) -> dict[int, tuple[int, int, int]]:
+        """Find block-major tensor configs that can register one region.
+
+        A tensor whose layers each own one page per block row
+        (``layer_stride == page``) in a single transfer group is block-major:
+        one descriptor can move every layer's bytes for a block, collapsing
+        L per-layer regions into one. Eligibility is strict because the
+        slice must be the only claim on its byte range: every layer needs a
+        spec of the same page size in the same transfer group, and no other
+        xfer buffer may alias a candidate's storage. Returns {} on any doubt,
+        falling back to per-layer regions.
+        """
+        if self._physical_blocks_per_logical_kv_block != 1:
+            return {}
+        candidates: dict[int, tuple[int, int, int]] = {}
+        for tensor_config in self.kv_cache_config.kv_cache_tensors:
+            layers = tensor_config.layers
+            if len(layers) < 2:
+                continue
+            if any(name not in xfer_buffers for name in layers):
+                continue
+            specs: list[KVCacheSpec] = []
+            for name in layers:
+                spec = self._layer_specs.get(name)
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    spec = spec.kv_cache_specs.get(name)
+                if spec is None or isinstance(spec, MambaSpec):
+                    specs = []
+                    break
+                specs.append(spec)
+            if not specs:
+                continue
+            pages = {spec.page_size_bytes for spec in specs}
+            group_ids = {
+                self.kv_cache_config.transfer_group_index_by_layer.get(name)
+                for name in layers
+            }
+            if (
+                len(pages) != 1
+                or tensor_config.layer_stride not in pages
+                or None in group_ids
+                or len(group_ids) != 1
+            ):
+                continue
+            views = [xfer_buffers[name] for name in layers]
+            slice_base = views[0].data_ptr()
+            if any(
+                view.data_ptr() != slice_base + i * tensor_config.layer_stride
+                for i, view in enumerate(views)
+            ):
+                continue
+            candidates[id(tensor_config)] = (
+                views[0].untyped_storage().data_ptr(),
+                slice_base,
+                len(layers) * pages.pop(),
+            )
+
+        by_storage: dict[int, list[tuple[int, int]]] = {}
+        for storage_ptr, base, length in candidates.values():
+            by_storage.setdefault(storage_ptr, []).append((base, length))
+        for ranges in by_storage.values():
+            ranges.sort()
+            for (base, length), (next_base, _) in zip(ranges, ranges[1:]):
+                if base + length > next_base:
+                    return {}
+
+        candidate_storages = set(by_storage)
+        for name, view in xfer_buffers.items():
+            config = tensor_configs.get(name)
+            if config is not None and id(config) in candidates:
+                continue
+            if view.untyped_storage().data_ptr() in candidate_storages:
+                return {}
+        return candidates
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
 
@@ -1142,6 +1223,10 @@ class NixlBaseConnectorWorker:
         }
 
         packed_storage = _share_storage_and_block_stride(list(xfer_buffers.values()))
+
+        # Block-major tensor configs (e.g. HiSparse host pools and indexer
+        # slices) collapse their layers into one whole-row region below.
+        slice_regions = self._tensor_slice_regions(xfer_buffers, tensor_configs)
 
         # K and V are packed into the content dim, so each attention layer is a
         # single NIXL region whose block transfers as one unit. Mamba layers instead
@@ -1213,8 +1298,15 @@ class NixlBaseConnectorWorker:
                 region_device_id = max(cache.get_device(), 0)
                 self.device_id = region_device_id
             if is_host_resident:
-                registration_base = cache.data_ptr()
-                registration_len = cache.nbytes
+                # A block-major host pool carves one strided view per layer out
+                # of one tensor; register the tensor's full extent, not the
+                # (whole-pool-sized) nbytes of the first layer's view.
+                assert tensor_config is not None
+                layer_idx = tensor_config.layers.index(layer_name)
+                registration_base = (
+                    cache.data_ptr() - layer_idx * tensor_config.layer_stride
+                )
+                registration_len = tensor_config.size
             else:
                 registration_base = storage_addr
                 registration_len = storage.nbytes()
@@ -1274,7 +1366,18 @@ class NixlBaseConnectorWorker:
                         num_blocks * physical_page_size * same_group_layers
                         == registration_len
                     )
-                if storage_is_block_major and (
+                slice_info = (
+                    slice_regions.get(id(tensor_config))
+                    if tensor_config is not None
+                    else None
+                )
+                if slice_info is not None and storage_is_block_major:
+                    # One descriptor moves one whole block row: every layer's
+                    # page of a block-major tensor. The dedup below collapses
+                    # the tensor's layers onto this single region.
+                    _, slice_base, slice_len = slice_info
+                    region_specs = [(slice_base, slice_len, block_stride)]
+                elif storage_is_block_major and (
                     (packed_storage and is_mla_region)
                     or (not hnc_contiguous and group_tiles_storage)
                 ):
@@ -1372,7 +1475,14 @@ class NixlBaseConnectorWorker:
                 self.vllm_config.parallel_config
             )
             num_local_layers = end_layer - start_layer
-            assert num_local_layers > 0 and self.num_regions % num_local_layers == 0
+            if self.num_regions % num_local_layers != 0:
+                raise NotImplementedError(
+                    "pipeline_parallel_size > 1 is not supported when "
+                    "block-major tensor slices collapse per-layer NIXL "
+                    f"regions ({self.num_regions} regions for "
+                    f"{num_local_layers} local layers)."
+                )
+            assert num_local_layers > 0
             regions_per_layer = self.num_regions // num_local_layers
             self._remote_region_offset = regions_per_layer * start_layer
 

@@ -113,6 +113,13 @@ class HiSparseConnectorWorker:
         assert resident is not None
         self.kernel_block_size = resident.block_size
         self.pages_per_host_block = pages_per_host_block
+        if pages_per_host_block != 1:
+            raise RuntimeError(
+                "HiSparse PD requires the host source group re-blocked to the "
+                f"kernel block size, got {pages_per_host_block} pages per host "
+                "block."
+            )
+        self.host_block_multiplier = cache_handles[0].runtime.host_block_multiplier
         self.host_num_blocks = host_num_blocks
         self.pinned_host_pools = pinned_host_pools
         self.cache_handles = cache_handles
@@ -199,8 +206,10 @@ class HiSparseConnectorWorker:
             dtype=torch.int64,
             device=device,
         )
+        # The pool is block-major, so each layer's writes anchor at its own
+        # suffix view; dst slots are shared block-major rows across layers.
         self.backup_host_cache_ptrs = torch.tensor(
-            [cache.data_ptr() for cache in host_caches],
+            [cache.runtime.host_cache.data_ptr() for cache in self.cache_handles],
             dtype=torch.uint64,
             device=device,
         )
@@ -291,7 +300,10 @@ class HiSparseConnectorWorker:
             self._block_staging_event = torch.Event()
         self._block_staging_event.record(torch.accelerator.current_stream(device))
         offsets = torch.arange(self.kernel_block_size, dtype=torch.int32, device=device)
-        slots = (blocks[:, None] * self.kernel_block_size + offsets[None, :]).flatten()
+        slots = (
+            blocks[:, None] * (self.host_block_multiplier * self.kernel_block_size)
+            + offsets[None, :]
+        ).flatten()
         for runtime in self.leader_runtimes:
             runtime.invalidate_slots(slots, request_state_indices)
 
@@ -331,7 +343,10 @@ class HiSparseConnectorWorker:
                     transfer.destination_block_id * self.pages_per_host_block
                     + transfer.destination_page_offset
                 )
-                dst[start:end] = host_page * self.kernel_block_size + offsets
+                dst[start:end] = (
+                    host_page * (self.host_block_multiplier * self.kernel_block_size)
+                    + offsets
+                )
             self.spill_src_gpu[:, :num_rows].copy_(
                 src_staging[:, :num_rows], non_blocking=True
             )

@@ -238,6 +238,11 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
         self._prefill_backend = (
             layer_prefill_backend.clone() if layer_prefill_backend is not None else None
         )
+        # The handle's runtime carries the host-pool geometry (bound once the
+        # KV caches are initialized); read the multiplier lazily at build time.
+        self._hisparse_handle: HiSparseCacheHandle | None = None
+        if vllm_config.attention_config.hisparse_config is not None:
+            self._hisparse_handle = getattr(attention_layer, "hisparse_cache", None)
 
     def _init_reorder_batch_threshold(
         self,
@@ -384,10 +389,14 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
                 self.vllm_config.attention_config.hisparse_config is not None
                 and chunked_context is not None
             ):
+                assert self._hisparse_handle is not None
                 staging_plan = build_hisparse_prefill_staging_plan(
                     block_table,
                     common_attn_metadata.seq_lens[num_decodes:],
                     self.kv_cache_spec.block_size,
+                    row_multiplier=(
+                        self._hisparse_handle.runtime.host_block_multiplier
+                    ),
                 )
                 block_table = staging_plan.block_table
             prefill = SparseMLAPrefillMetadata(
