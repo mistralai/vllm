@@ -11,6 +11,7 @@ import psutil
 import torch
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -659,7 +660,16 @@ class HiSparseRuntime:
             0,
         )
 
-        if produce_plan and group.followers and prefetch_followers:
+        # The side-stream prefetch overlaps follower gathers with the leader's
+        # attention, but stream/event logic does not survive CUDA-graph capture
+        # and replay. VLLM_HISPARSE_DISABLE_PREFETCH=1 falls back to gathering
+        # on the compute stream via apply_plan's inline path.
+        if (
+            produce_plan
+            and group.followers
+            and prefetch_followers
+            and not envs.VLLM_HISPARSE_DISABLE_PREFETCH
+        ):
             self._prefetch_group(num_tokens, plan_row_offset)
 
         if not return_valid_counts:
