@@ -15,6 +15,9 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.stats import (
+    HiSparseKVConnectorStats,
+)
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tp_group,
@@ -31,7 +34,6 @@ from vllm.v1.kv_cache_interface import (
     HiSparseHotSpec,
     KVCacheConfig,
 )
-from vllm.v1.metrics.stats import HiSparseStats
 from vllm.v1.worker.utils import copy_kv_cache_blocks_inplace
 
 if TYPE_CHECKING:
@@ -508,19 +510,18 @@ class HiSparseConnectorWorker:
         for runtime in self.leader_runtimes:
             runtime.reset_hot_state()
 
-    def finish_step(self) -> HiSparseStats | None:
-        delta = None
+    def get_kv_connector_stats(self) -> HiSparseKVConnectorStats | None:
+        stats = None
         if self._metrics_pending and self._metrics_event.query():
-            delta = HiSparseStats()
+            stats = HiSparseKVConnectorStats()
             for runtime in self.leader_runtimes:
                 group = runtime.index_group
                 hits, misses = group.swap_stats_host.tolist()
-                delta.cache_hits += hits
-                delta.cache_misses += misses
-                delta.host_to_device_bytes += misses * group.stats_row_bytes
+                if hits or misses:
+                    stats.record_snapshot(hits, misses, misses * group.stats_row_bytes)
             self._metrics_pending = False
-            if delta.cache_hits == 0 and delta.cache_misses == 0:
-                delta = None
+            if stats.is_empty():
+                stats = None
 
         self._metrics_calls += 1
         if (
@@ -537,7 +538,7 @@ class HiSparseConnectorWorker:
                 group.copy_stream.wait_stream(compute_stream)
             self._metrics_event.record()
             self._metrics_pending = True
-        return delta
+        return stats
 
     def _release_completed_dma_descriptors(self) -> None:
         pending = self._pending_dma_descriptors

@@ -29,7 +29,6 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlockCopy,
 )
 from vllm.v1.hisparse.types import SparseKVPageTransfer, SparseKVRowMirror
-from vllm.v1.metrics.stats import HiSparseStats
 from vllm.v1.worker.utils import bind_kv_cache, copy_kv_cache_blocks_inplace
 
 
@@ -54,13 +53,8 @@ def _make_hisparse_worker() -> HiSparseConnectorWorker:
     return worker
 
 
-def test_hisparse_worker_finish_step_reads_completed_snapshot(monkeypatch):
+def test_hisparse_worker_get_kv_connector_stats_reads_completed_snapshot(monkeypatch):
     worker = _make_hisparse_worker()
-    worker.is_host_writer = False
-    worker._finish_mirror_phase = MagicMock()
-    worker._submit_transfers = MagicMock()
-    worker._release_completed_dma_descriptors = MagicMock()
-    worker._post_forward_transfers = []
     worker._metrics_calls = hisparse_worker_module._METRICS_INTERVAL - 1
     worker._metrics_pending = False
     worker._metrics_event = MagicMock()
@@ -78,12 +72,19 @@ def test_hisparse_worker_finish_step_reads_completed_snapshot(monkeypatch):
         hisparse_worker_module, "current_stream", lambda: compute_stream
     )
 
-    assert worker.finish_step() is None
+    assert worker.get_kv_connector_stats() is None
     compute_stream.wait_stream.assert_called_once_with(group.copy_stream)
     group.copy_stream.wait_stream.assert_called_once_with(compute_stream)
     worker._metrics_event.record.assert_called_once_with()
     assert group.swap_stats.tolist() == [0, 0]
-    assert worker.finish_step() == HiSparseStats(12, 4, 64)
+
+    stats = worker.get_kv_connector_stats()
+    assert stats is not None
+    assert stats.data == {
+        "cache_hits": [12],
+        "cache_misses": [4],
+        "host_to_device_bytes": [64],
+    }
 
 
 def test_hisparse_row_mirrors_follow_runner_request_order():
