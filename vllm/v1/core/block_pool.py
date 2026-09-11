@@ -179,6 +179,8 @@ class BlockPool:
         # list of free blocks (including eviction candidates when caching is
         # enabled).
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        # 2Q Protected queue for multi-hit and conversation continuation blocks.
+        self.protected_block_queue = FreeKVCacheBlockQueue([])
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -220,6 +222,8 @@ class BlockPool:
             if not block:
                 return None
             cached_blocks.append(block)
+        for block in cached_blocks:
+            block.hits += 1
         return cached_blocks
 
     def cache_full_blocks(
@@ -288,7 +292,9 @@ class BlockPool:
                     blk.block_hash_num_tokens is not None
                     and blk.block_hash_num_tokens < num_hash_tokens
                 )
+                saved_hits = blk.hits
                 removed_hashes = self._remove_cached_block_hashes(blk)
+                blk.hits = saved_hits
                 self._emit_block_removed_events(removed_hashes)
             self._insert_block_hash(
                 block_hash_with_group_id,
@@ -504,7 +510,9 @@ class BlockPool:
             )
         )
         if replace_existing_hashes:
+            saved_hits = block.hits
             removed_hashes = self._remove_cached_block_hashes(block)
+            block.hits = saved_hits
             self._emit_block_removed_events(removed_hashes)
             already_cached = False
         elif (
@@ -513,7 +521,9 @@ class BlockPool:
             and block.block_hash_num_tokens is not None
             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
         ):
+            saved_hits = block.hits
             removed_hashes = self._remove_cached_block_hashes(block)
+            block.hits = saved_hits
             self._emit_block_removed_events(removed_hashes)
         self._insert_block_hash(
             block_hash_with_group_id,
@@ -651,6 +661,7 @@ class BlockPool:
         assert dst_block.block_hash is None
         assert dst_block.block_id not in self.cached_block_hashes_by_block
         num_tokens = src_block.block_hash_num_tokens
+        dst_block.hits = src_block.hits
         for block_hash in self._remove_cached_block_hashes(src_block):
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
@@ -669,7 +680,17 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        # 2Q Eviction: pop from free_block_queue (non-cached + probation) first;
+        # if exhausted, pop LRU candidates from protected_block_queue.
+        num_from_probation = min(num_blocks, self.free_block_queue.num_free_blocks)
+        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_from_probation)
+
+        num_from_protected = num_blocks - num_from_probation
+        if num_from_protected > 0:
+            protected_blocks = self.protected_block_queue.popleft_n(num_from_protected)
+            for block in protected_blocks:
+                block.is_protected = False
+            ret.extend(protected_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -702,10 +723,15 @@ class BlockPool:
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
 
+        was_protected = block.is_protected
         evicted_hashes = self._remove_cached_block_hashes(block)
         if not evicted_hashes:
             # The block doesn't have hash, eviction is not needed
             return False
+
+        if block.ref_cnt == 0 and not block.is_null and was_protected:
+            self.protected_block_queue.remove(block)
+            self.free_block_queue.append(block)
 
         self._emit_block_removed_events(evicted_hashes)
         return True
@@ -722,7 +748,11 @@ class BlockPool:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
-                self.free_block_queue.remove(block)
+                if block.is_protected:
+                    self.protected_block_queue.remove(block)
+                    block.is_protected = False
+                else:
+                    self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -739,23 +769,43 @@ class BlockPool:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
         """
-        # Identify blocks with hash (LRU cache) and without it (never match APC)
-        blocks_to_evict_last = []
+        # 2Q (Two-Queue) Eviction Policy with Prefix Continuity:
+        # Preserves all core Automatic Prefix Caching (APC) invariants:
+        # (https://docs.vllm.ai/en/v0.6.0/automatic_prefix_caching/details.html)
+        # 1. Hashing and prefix-matching logic are completely untouched.
+        # 2. Reference counting (ref_cnt > 0) strictly guards actively generating blocks.
+        # 3. Tail-first ordering of ordered_blocks is preserved, guaranteeing that
+        #    child blocks in probation are evicted before their parent prefix blocks.
+        # 4. Continuation blocks extending an active prefix inherit protected status,
+        #    preventing scan floods from truncating multi-turn conversation histories.
+        block_list = list(ordered_blocks)
+        is_continuation = any(b.hits > 0 for b in block_list)
+
+        blocks_to_protected = []
         blocks_to_evict_first = []
-        for block in ordered_blocks:
+        blocks_to_probation = []
+        for block in block_list:
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
+                    block.is_protected = False
                     blocks_to_evict_first.append(block)
+                elif block.hits > 0 or is_continuation:
+                    # 2Q Protected (Am): Multi-hit verified blocks and conversation continuations.
+                    block.is_protected = True
+                    blocks_to_protected.append(block)
                 else:
-                    # FIFO reuse of cached blocks for LRU eviction behavior.
-                    blocks_to_evict_last.append(block)
+                    # 2Q Probation (A1_in): Single-hit unverified blocks (evicted before protected).
+                    block.is_protected = False
+                    blocks_to_probation.append(block)
 
-        # Blocks to reuse first are prepended to the front of the free queue.
+        # Non-cached blocks are prepended to the front of the free queue.
         self.free_block_queue.prepend_n(blocks_to_evict_first)
-        # Blocks to reuse last are appended to the end of the free queue.
-        self.free_block_queue.append_n(blocks_to_evict_last)
+        # 2Q probation blocks are queued in free_block_queue (FIFO eviction before protected).
+        self.free_block_queue.append_n(blocks_to_probation)
+        # 2Q protected blocks are queued in protected_block_queue (LRU eviction).
+        self.protected_block_queue.append_n(blocks_to_protected)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -802,6 +852,13 @@ class BlockPool:
         for block in self.blocks:
             block.reset_hash()
 
+        # In 2Q, move any protected blocks back to the free block queue
+        if self.protected_block_queue.num_free_blocks > 0:
+            protected_blocks = self.protected_block_queue.popleft_n(
+                self.protected_block_queue.num_free_blocks
+            )
+            self.free_block_queue.append_n(protected_blocks)
+
         if self.metrics_collector:
             self.metrics_collector.reset()
 
@@ -818,7 +875,10 @@ class BlockPool:
         Returns:
             The number of free blocks.
         """
-        return self.free_block_queue.num_free_blocks
+        return (
+            self.free_block_queue.num_free_blocks
+            + self.protected_block_queue.num_free_blocks
+        )
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

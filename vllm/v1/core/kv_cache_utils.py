@@ -183,6 +183,10 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+    # 2Q Eviction hit counter to differentiate probation vs protected blocks.
+    hits: int = 0
+    # 2Q Protected queue indicator
+    is_protected: bool = False
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
@@ -207,6 +211,8 @@ class KVCacheBlock:
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
         self._block_hash_num_tokens = None
+        self.hits = 0
+        self.is_protected = False
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
