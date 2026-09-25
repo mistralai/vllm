@@ -9,6 +9,9 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.distributed.device_communicators.nvlink_fabric import (
+    has_cross_node_nvlink,
+)
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -30,9 +33,16 @@ except ImportError:
 
 
 @functools.cache
+def _group_is_intra_node(group: GroupCoordinator) -> bool:
+    return all(in_the_same_node_as(group.cpu_group, source_rank=0))
+
+
+@functools.cache
 def _symm_mem_spans_group(group: GroupCoordinator) -> bool:
     """Probe whether the group has NVLS symmetric memory."""
     if not symm_mem_available:
+        return False
+    if not _group_is_intra_node(group) and not has_cross_node_nvlink(group.cpu_group):
         return False
     try:
         from torch._C._autograd import DeviceType
@@ -69,10 +79,7 @@ def direct_cp_enabled(
         symm_mem_available
         and current_platform.is_cuda()
         and (supported_dtypes is None or dtype in supported_dtypes)
-        and (
-            all(in_the_same_node_as(group.cpu_group, source_rank=0))
-            or _symm_mem_spans_group(group)
-        )
+        and (_group_is_intra_node(group) or _symm_mem_spans_group(group))
     )
 
 
