@@ -378,7 +378,7 @@ Configure both settings in `kv_connector_extra_config`:
 
 The Prometheus counter `vllm:mooncake_store_save_jobs_dropped_total` counts
 logical save jobs once per engine, with `reason="block_budget"` or
-`reason="start_timeout"`. A timeout on any worker counts that job once;
+`reason="start_timeout"` or `reason="circuit_breaker"`. A drop on any worker counts that job once;
 other workers may already have started saving it. These are skipped cache
 writes, not failed inference requests, keys, or blocks. SDK operation failures
 remain in the existing operation and failed-key counters.
@@ -389,6 +389,31 @@ For a Grafana panel showing dropped jobs over the last five minutes:
 sum by (reason) (increase(vllm:mooncake_store_save_jobs_dropped_total[5m]))
 ```
 
+### Save circuit breaker
+
+Each worker has its own save breaker, separate from prefix lookup. After
+`save_failure_threshold` failed save jobs (default `3`), it skips saves for
+`save_cooldown_s` (default `30.0` seconds). Skipped jobs make no SDK existence
+or PUT calls and report completion, releasing their GPU references once all
+ranks finish. The dropped-job metric uses `reason="circuit_breaker"`.
+
+An existence-check error, PUT exception, or negative per-key result counts as
+one failure for that job, including partial failures. A successful existence
+check or boundary PUT cannot erase a later PUT failure in the same job. A job
+whose SDK calls succeed and which performs a PUT resets the breaker. Jobs
+satisfied entirely by existing keys do not establish write recovery.
+
+After cooldown, the next eligible job probes the store. A successful write
+closes the breaker; a failed probe starts another cooldown. A probe that finds
+only cached keys leaves writes unverified, so another probe can run after the
+same cooldown interval. Queue expiry, budget rejection, and jobs that never
+reach the SDK do not count as store failures.
+
+The combined flow is: scheduler block-budget admission, worker queue expiry,
+save-breaker check before SDK calls, existence check, then PUT. Active native
+I/O is not cancelled or timed out by this breaker. It opens only after failures
+return, while the block budget continues to bound references held by saves.
+
 ### kv_connector_extra_config
 
 - `load_async` (bool): Enable asynchronous loading for better compute-I/O overlap. Default: `true`.
@@ -397,6 +422,8 @@ sum by (reason) (increase(vllm:mooncake_store_save_jobs_dropped_total[5m]))
 - `lookup_prefetch_ttl_s` (float): Maximum age of a completed async lookup result, measured from when its RPC returned. Older results are looked up again, as are lookups whose token/hash range changed. Pending lookups use the separate lookup timeout above. Default: `2.0` seconds.
 - `max_pending_blocks_ratio` (float): Fraction of GPU KV blocks that queued and active saves may hold. Default: `0.1`; valid range: `[0, 1]`.
 - `save_start_timeout_s` (float): Maximum queued wait before a save starts. Default: `10.0` seconds; must be finite and positive. Does not cancel active native I/O.
+- `save_failure_threshold` (int): Failed save jobs needed to open the worker save breaker. Default: `3`; must be positive.
+- `save_cooldown_s` (float): Save-breaker cooldown and probe interval. Default: `30.0` seconds; must be finite and positive.
 - `lookup_timeout_s` (float): Maximum wait for a prefix lookup, including executor queue time. Default: `1.0` seconds.
 - `lookup_rpc_port` (int): Custom port for the ZMQ lookup RPC socket. Default: `0`.
 - `custom_mem_pool` (str): Optional Mooncake allocator for the GPU KV cache.

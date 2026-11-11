@@ -201,7 +201,7 @@ class MooncakeStoreScheduler:
             int(kv_cache_config.num_blocks * save_config.max_pending_blocks_ratio)
         )
         self._save_drops: dict[str, int] = {}
-        self._expired_save_ids: set[int] = set()
+        self._dropped_save_ids: set[int] = set()
         self._save_drop_metrics_pending = False
 
         # Per-request state
@@ -782,13 +782,17 @@ class MooncakeStoreScheduler:
             return
         pool = self._gpu_block_pool
         assert pool is not None
-        for store_job_id in meta.expired_saves:
-            if (
-                store_job_id in self._pinned_saves
-                and store_job_id not in self._expired_save_ids
-            ):
-                self._expired_save_ids.add(store_job_id)
-                self._record_save_drop("start_timeout")
+        for reason, dropped in (
+            ("start_timeout", meta.expired_saves),
+            ("circuit_breaker", meta.breaker_skipped_saves),
+        ):
+            for store_job_id in dropped:
+                if (
+                    store_job_id in self._pinned_saves
+                    and store_job_id not in self._dropped_save_ids
+                ):
+                    self._dropped_save_ids.add(store_job_id)
+                    self._record_save_drop(reason)
         for store_job_id, count in meta.completed_saves.items():
             pinned = self._pinned_saves.get(store_job_id)
             if pinned is None:
@@ -803,7 +807,7 @@ class MooncakeStoreScheduler:
                 f"store job {store_job_id} reported by too many ranks"
             )
             del self._pinned_saves[store_job_id]
-            self._expired_save_ids.discard(store_job_id)
+            self._dropped_save_ids.discard(store_job_id)
             self._save_budget.release(block_ids)
             # Tail-first, as elsewhere, so the shared prefix is evicted last.
             pool.free_blocks(pool.blocks[bid] for bid in reversed(block_ids))

@@ -594,9 +594,18 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # token suffix without full snapshots on the normal path.
         self._retry_token_ids: dict[str, tuple[int, list[int]]] = {}
         self._expired_saves: set[int] = set()
-        self.request_queue: SaveQueue = SaveQueue(
-            save_config if save_config is not None else SaveConfig()
+        config = save_config if save_config is not None else SaveConfig()
+        self.request_queue: SaveQueue = SaveQueue(config)
+        self.save_circuit_breaker = CircuitBreaker(
+            "Mooncake save",
+            config.save_cooldown_s,
+            config.save_failure_threshold,
+            probe_window_s=config.save_cooldown_s,
         )
+        self._breaker_skipped_saves: set[int] = set()
+        # Only the serial sender changes the outcome of the active job.
+        self._save_job_outcome: bool | None = None
+        self._save_job_had_put = False
 
     def add_request(self, request: ReqMeta) -> None:
         self.expire_queued_saves()
@@ -620,6 +629,37 @@ class KVCacheStoreSendingThread(KVTransferThread):
             expired = self._expired_saves
             self._expired_saves = set()
         return expired
+
+    def take_breaker_skipped_saves(self) -> set[int]:
+        with self.done_task_lock:
+            skipped = self._breaker_skipped_saves
+            self._breaker_skipped_saves = set()
+        return skipped
+
+    def _record_operation(
+        self,
+        operation: str,
+        start_time: float,
+        num_keys: int,
+        *,
+        num_bytes: int = 0,
+        status: str = "ok",
+        num_failed_keys: int = 0,
+    ) -> None:
+        """Collect one job outcome across existence checks and PUT batches."""
+        if operation in ("save_exists", "save_put") and num_keys:
+            self._save_job_outcome = (
+                self._save_job_outcome is not False and status == "ok"
+            )
+            self._save_job_had_put |= operation == "save_put"
+        super()._record_operation(
+            operation,
+            start_time,
+            num_keys,
+            num_bytes=num_bytes,
+            status=status,
+            num_failed_keys=num_failed_keys,
+        )
 
     def is_live_store_job(self, req_meta: ReqMeta) -> bool:
         with self.done_task_lock:
@@ -775,7 +815,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     )
         return puts
 
-    def _check_keys_exist(self, req_id: str, keys: list[str]) -> list[int] | None:
+    def _check_keys_exist(self, req_meta: ReqMeta, keys: list[str]) -> list[int] | None:
+        if self._save_job_outcome is None and not self.save_circuit_breaker.allow():
+            assert req_meta.store_job_id is not None
+            with self.done_task_lock:
+                self._breaker_skipped_saves.add(req_meta.store_job_id)
+            return None
+        req_id = req_meta.req_id
         start = time.perf_counter()
         try:
             results = self.store.batch_is_exist(keys)
@@ -839,7 +885,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if self.enable_group_semantics and self.supports_group_ids
             else None
         )
-        exists = self._check_keys_exist(req_meta.req_id, keys)
+        exists = self._check_keys_exist(req_meta, keys)
         if exists is None:
             return False
         missing = [i for i, e in enumerate(exists) if e != 1]
@@ -911,6 +957,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
     def _handle_request(self, req_meta: ReqMeta):
         # The single `finally` is the only way out, so the scheduler releases
         # this job's GPU block references however the job ends.
+        self._save_job_outcome = None
+        self._save_job_had_put = False
         save_completed = False
         available_token_len = 0
         checkpoint_len = 0
@@ -1038,7 +1086,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 return
 
             # Check which blocks already exist (dedup)
-            exists_states = self._check_keys_exist(req_id, keys)
+            exists_states = self._check_keys_exist(req_meta, keys)
             if exists_states is None:
                 return
             missing_indices = [
@@ -1245,6 +1293,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if self.enable_kv_event and stored_events:
                 self.update_kv_event(stored_events)
         finally:
+            if self._save_job_outcome is False:
+                self.save_circuit_breaker.record_failure()
+            elif self._save_job_outcome is True and self._save_job_had_put:
+                self.save_circuit_breaker.record_success()
             if save_completed:
                 self._record_saved_offset(req_meta, checkpoint_len)
             if self.enable_kv_event and available_token_len:
@@ -2556,6 +2608,7 @@ class MooncakeStoreWorker:
         return MooncakeStoreWorkerMetadata(
             completed_saves=completed_saves,
             expired_saves=self.kv_send_thread.take_expired_saves(),
+            breaker_skipped_saves=self.kv_send_thread.take_breaker_skipped_saves(),
         )
 
     def lookup(

@@ -18,6 +18,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.data import (
 class SaveConfig:
     max_pending_blocks_ratio: float = 0.1
     save_start_timeout_s: float = 10.0
+    save_failure_threshold: int = 3
+    save_cooldown_s: float = 30.0
 
     def __post_init__(self) -> None:
         ratio = self.max_pending_blocks_ratio
@@ -28,14 +30,24 @@ class SaveConfig:
             or not 0 <= ratio <= 1
         ):
             raise ValueError("max_pending_blocks_ratio must be between 0 and 1")
-        timeout = self.save_start_timeout_s
-        if (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, (int, float))
-            or not math.isfinite(timeout)
-            or timeout <= 0
+        for name, value in (
+            ("save_start_timeout_s", self.save_start_timeout_s),
+            ("save_cooldown_s", self.save_cooldown_s),
         ):
-            raise ValueError("save_start_timeout_s must be finite and positive")
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be finite and positive")
+        threshold = self.save_failure_threshold
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, int)
+            or threshold <= 0
+        ):
+            raise ValueError("save_failure_threshold must be a positive integer")
 
     @classmethod
     def from_extra_config(cls, extra: Mapping[str, Any]) -> "SaveConfig":

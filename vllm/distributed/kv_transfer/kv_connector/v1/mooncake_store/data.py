@@ -401,12 +401,14 @@ class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
 
     completed_saves: dict[int, int] = field(default_factory=dict)
     expired_saves: set[int] = field(default_factory=set)
+    breaker_skipped_saves: set[int] = field(default_factory=set)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
     ) -> "MooncakeStoreWorkerMetadata":
         assert isinstance(other, MooncakeStoreWorkerMetadata)
         self.expired_saves.update(other.expired_saves)
+        self.breaker_skipped_saves.update(other.breaker_skipped_saves)
         for store_job_id, count in other.completed_saves.items():
             self.completed_saves[store_job_id] = (
                 self.completed_saves.get(store_job_id, 0) + count

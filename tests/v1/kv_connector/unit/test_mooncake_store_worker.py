@@ -2104,6 +2104,104 @@ def test_failed_put_still_completes_save(error: int) -> None:
     assert stats.data["save_put"][0]["status"] != "ok"
 
 
+@pytest.mark.parametrize("boundary_save", [False, True])
+@pytest.mark.parametrize(
+    "failing_call,raises",
+    [
+        ("batch_is_exist", False),
+        ("batch_is_exist", True),
+        ("batch_put_from_multi_buffers", False),
+        ("batch_put_from_multi_buffers", True),
+    ],
+)
+def test_save_breaker_skips_sdk_calls_and_recovers(
+    monkeypatch, boundary_save: bool, failing_call: str, raises: bool
+) -> None:
+    now = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.return_value = [0, 0]
+    failed = getattr(store, failing_call)
+    if raises:
+        failed.side_effect = RuntimeError("SDK unavailable")
+    else:
+        failed.return_value = [-900, -900]
+    sender = _make_store_sending_thread(store)
+
+    def run_job(job: int) -> None:
+        req = _make_store_req(f"breaker-{job}", [b"a0", b"a1"])
+        req.store_job_id = job
+        if boundary_save:
+            req.token_len_chunk = 0
+            req.boundary_puts = [BoundaryPut(0, 1, 16), BoundaryPut(0, 2, 32)]
+        _run_store_req(sender, req)
+        assert sender.take_completed_saves() == {job: 1}
+
+    for job in range(3):
+        run_job(job)
+    run_job(3)
+    assert failed.call_count == 3
+    assert sender.save_circuit_breaker.is_open
+    assert sender.take_breaker_skipped_saves() == {3}
+
+    # A failed probe must reopen the breaker rather than admitting a burst.
+    now[0] = 31.0
+    run_job(4)
+    run_job(5)
+    assert failed.call_count == 4
+    assert sender.take_breaker_skipped_saves() == {5}
+
+    now[0] = 62.0
+    failed.side_effect = None
+    failed.return_value = [0, 0]
+    run_job(6)
+    assert not sender.save_circuit_breaker.is_open
+    run_job(7)
+    assert failed.call_count == 6
+    assert not sender.take_breaker_skipped_saves()
+
+
+def test_cached_save_does_not_clear_put_failures(monkeypatch) -> None:
+    now = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.return_value = [-900, -900]
+    sender = _make_store_sending_thread(store)
+    _run_store_req(sender, _make_store_req("failed-0", [b"a0", b"a1"]))
+    store.batch_is_exist.return_value = [1, 1]
+    _run_store_req(sender, _make_store_req("cached", [b"a0", b"a1"]))
+    store.batch_is_exist.return_value = [0, 0]
+    for i in (1, 2):
+        _run_store_req(sender, _make_store_req(f"failed-{i}", [b"a0", b"a1"]))
+    assert sender.save_circuit_breaker.is_open
+    assert store.batch_put_from_multi_buffers.call_count == 3
+    now[0] = 31.0
+    store.batch_is_exist.return_value = [1, 1]
+    _run_store_req(sender, _make_store_req("cached-probe", [b"a0", b"a1"]))
+    assert sender.save_circuit_breaker.is_open
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.return_value = [0, 0]
+    now[0] = 62.0
+    _run_store_req(sender, _make_store_req("write-probe", [b"a0", b"a1"]))
+    assert not sender.save_circuit_breaker.is_open
+    assert store.batch_put_from_multi_buffers.call_count == 4
+
+
+def test_boundary_success_does_not_mask_regular_put_failure() -> None:
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.side_effect = [[0, 0], [-900, -900]] * 3
+    sender = _make_store_sending_thread(store)
+    for i in range(3):
+        req = _make_store_req(f"mixed-{i}", [b"a0", b"a1"])
+        req.boundary_puts = [BoundaryPut(0, 1, 16), BoundaryPut(0, 2, 32)]
+        _run_store_req(sender, req)
+    assert sender.save_circuit_breaker.is_open
+    assert store.batch_put_from_multi_buffers.call_count == 6
+
+
 def test_expired_queued_save_completes_while_active_put_keeps_running(monkeypatch):
     now = [0.0]
     monkeypatch.setattr(time, "monotonic", lambda: now[0])
@@ -2119,7 +2217,7 @@ def test_expired_queued_save_completes_while_active_put_keeps_running(monkeypatc
 
     store.batch_put_from_multi_buffers.side_effect = blocked_put
     sender = _make_store_sending_thread(
-        store, save_config=SaveConfig(save_start_timeout_s=1)
+        store, save_config=SaveConfig(save_start_timeout_s=1, save_failure_threshold=1)
     )
     active = _make_store_req("active", [b"a0", b"a1"])
     active.store_job_id = 1
@@ -2136,6 +2234,7 @@ def test_expired_queued_save_completes_while_active_put_keeps_running(monkeypatc
         now[0] = 2.0
         assert sender.take_completed_saves() == {2: 1}
         assert sender.take_expired_saves() == {2}
+        assert not sender.save_circuit_breaker.is_open
         assert sender.request_queue.unfinished_tasks == 1
         assert store.batch_put_from_multi_buffers.call_count == 1
     finally:
@@ -2143,6 +2242,7 @@ def test_expired_queued_save_completes_while_active_put_keeps_running(monkeypatc
         thread.join(3)
     assert not thread.is_alive()
     assert sender.take_completed_saves() == {1: 1}
+    assert sender.save_circuit_breaker.is_open
     assert sender.request_queue.unfinished_tasks == 0
 
 
@@ -2151,12 +2251,17 @@ def test_save_drop_metrics_deduplicate_totals_across_reports():
     first = MooncakeStoreConnectorStats()
     first.record_save_drop_totals({"block_budget": 2}, recorded)
     second = MooncakeStoreConnectorStats()
-    second.record_save_drop_totals({"block_budget": 2, "start_timeout": 1}, recorded)
-    second.record_save_drop_totals({"block_budget": 2, "start_timeout": 1}, recorded)
+    second.record_save_drop_totals(
+        {"block_budget": 2, "start_timeout": 1, "circuit_breaker": 1}, recorded
+    )
+    second.record_save_drop_totals(
+        {"block_budget": 2, "start_timeout": 1, "circuit_breaker": 1}, recorded
+    )
     first.aggregate(second)
     assert first.reduce() == {
         "save_jobs_dropped_block_budget": 2,
         "save_jobs_dropped_start_timeout": 1,
+        "save_jobs_dropped_circuit_breaker": 1,
     }
     registry = CollectorRegistry()
     factories = {
@@ -2176,6 +2281,11 @@ def test_save_drop_metrics_deduplicate_totals_across_reports():
     )
     assert (
         registry.get_sample_value(name, {"model": "test", "reason": "start_timeout"})
+        == 1
+    )
+
+    assert (
+        registry.get_sample_value(name, {"model": "test", "reason": "circuit_breaker"})
         == 1
     )
 

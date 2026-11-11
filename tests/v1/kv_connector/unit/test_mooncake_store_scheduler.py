@@ -89,7 +89,7 @@ def _make_bare_scheduler(
     scheduler._pinned_saves = {}
     scheduler._save_budget = SaveBlockBudget(max_pending_blocks)
     scheduler._save_drops = {}
-    scheduler._expired_save_ids = set()
+    scheduler._dropped_save_ids = set()
     scheduler._save_drop_metrics_pending = False
     scheduler._boundary_state_group_ids = frozenset({1})
     scheduler._store_coord = MooncakeStoreCoordinator(
@@ -2059,7 +2059,8 @@ def test_save_admission_rejects_before_pinning_gpu_blocks():
     assert scheduler.has_pending_push_work() is False
 
 
-def test_expired_save_is_counted_once_and_held_until_all_ranks_finish():
+@pytest.mark.parametrize("reason", ["start_timeout", "circuit_breaker"])
+def test_dropped_save_is_counted_once_and_held_until_all_ranks_finish(reason: str):
     scheduler, pool, blocks, meta = _admission_case(2 / 64)
     job = meta.requests[0].store_job_id
     assert job is not None
@@ -2068,7 +2069,13 @@ def test_expired_save_is_counted_once_and_held_until_all_ranks_finish():
         scheduler.update_connector_output(
             KVConnectorOutput(
                 kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
-                    completed_saves={job: 1}, expired_saves={job}
+                    completed_saves={job: 1},
+                    expired_saves={job}
+                    if reason == "start_timeout" or expected_refs == 0
+                    else set(),
+                    breaker_skipped_saves={job}
+                    if reason == "circuit_breaker" or expected_refs == 0
+                    else set(),
                 )
             )
         )
@@ -2077,7 +2084,7 @@ def test_expired_save_is_counted_once_and_held_until_all_ranks_finish():
     output = SchedulerOutput.make_empty()
     output.finished_req_ids = {"admission"}
     totals = scheduler.build_connector_meta(output).save_drop_totals
-    assert totals == {"start_timeout": 1}
+    assert totals == {reason: 1}
     assert not scheduler.has_pending_push_work()
 
 
