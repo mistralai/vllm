@@ -585,18 +585,6 @@ restart recovery or forced teardown during transfers.
 
 ## Notes
 
-### Cache-save failures
-
-The Mooncake SDK can return a negative error code for an individual key
-without raising a Python exception. A failed existence check is recorded as
-an error or partial failure, and the save is skipped rather than treating
-the failed keys as cache misses and attempting a PUT.
-
-A failed save still reports completion after the native operation returns.
-Its GPU source blocks become reusable once every worker has completed the
-save job. This does not cancel an active transfer or release its buffers
-while it may still be reading them.
-
 ### Reproducible Block Hashes Across Processes
 
 The `MooncakeStoreConnector` relies on consistent block hashes across all vLLM processes sharing the distributed store. Block hashes chain from `NONE_HASH`, which is derived from a fixed default seed, so identical prompts produce identical block hashes across processes by default — enabling cross-process prefix cache hits without extra configuration.
