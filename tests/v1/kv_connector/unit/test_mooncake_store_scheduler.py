@@ -7,6 +7,13 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from vllm.config import (
+    CacheConfig,
+    DeviceConfig,
+    KVTransferConfig,
+    ParallelConfig,
+    VllmConfig,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.coordinator import (
     MooncakeStoreCoordinator,
 )
@@ -19,14 +26,22 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.data import (
     ReqMeta,
     RequestTracker,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.save import (
+    SaveBlockBudget,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.scheduler import (
     MooncakeStoreScheduler,
     _partial_tail_non_mamba_puts,
 )
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.core.sched.output import KVConnectorBlockState
+from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
+from vllm.v1.core.sched.output import (
+    KVConnectorBlockState,
+    NewRequestData,
+    SchedulerOutput,
+)
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -34,6 +49,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
 )
+from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import Request
 
 
 def _make_bare_scheduler(
@@ -42,6 +59,7 @@ def _make_bare_scheduler(
     enable_partial_hash_hits: bool = False,
     kv_role: str = "kv_both",
     save_decode_cache: bool = False,
+    max_pending_blocks: int = 64,
 ) -> MooncakeStoreScheduler:
     scheduler = object.__new__(MooncakeStoreScheduler)
     scheduler.kv_role = kv_role
@@ -69,6 +87,10 @@ def _make_bare_scheduler(
     scheduler._num_workers = 1
     scheduler._next_store_job_id = 0
     scheduler._pinned_saves = {}
+    scheduler._save_budget = SaveBlockBudget(max_pending_blocks)
+    scheduler._save_drops = {}
+    scheduler._expired_save_ids = set()
+    scheduler._save_drop_metrics_pending = False
     scheduler._boundary_state_group_ids = frozenset({1})
     scheduler._store_coord = MooncakeStoreCoordinator(
         [
@@ -1965,3 +1987,106 @@ def test_worker_metadata_aggregates_completions_across_ranks():
         MooncakeStoreWorkerMetadata(completed_saves={1: 1, 2: 1})
     )
     assert merged.completed_saves == {1: 2, 2: 1}
+
+
+def _admission_case(
+    ratio: float,
+) -> tuple[
+    MooncakeStoreScheduler,
+    BlockPool,
+    list[KVCacheBlock],
+    MooncakeStoreConnectorMetadata,
+]:
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        cache_config=CacheConfig(block_size=16),
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=2, distributed_executor_backend="mp"
+        ),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="MooncakeStoreConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={"max_pending_blocks_ratio": ratio},
+        ),
+    )
+    kv_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            )
+        ],
+    )
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.scheduler.LookupKeyClient"
+    ):
+        scheduler = MooncakeStoreScheduler(config, kv_config)
+    pool = BlockPool(num_gpu_blocks=64, enable_caching=True, hash_block_size=16)
+    scheduler.bind_gpu_block_pool(pool)
+    request = Request(
+        "admission",
+        list(range(32)),
+        SamplingParams(max_tokens=1),
+        None,
+        block_hashes=[BlockHash(b"a0"), BlockHash(b"a1")],
+    )
+    blocks = pool.get_new_blocks(2)
+    ids = ([b.block_id for b in blocks],)
+    scheduler.update_state_after_alloc(request, KVCacheBlocks((blocks,)), 0)
+    output = SchedulerOutput.make_empty()
+    output.scheduled_new_reqs = [
+        NewRequestData.from_request(request, ids, list(range(32)))
+    ]
+    output.num_scheduled_tokens = {request.request_id: 32}
+    output.total_num_scheduled_tokens = 32
+    output.kv_connector_block_state = KVConnectorBlockState(
+        req_ids={request.request_id},
+        resolve_block_ids=lambda _: ids,
+        boundary_state_offloads={},
+    )
+    return scheduler, pool, blocks, scheduler.build_connector_meta(output)
+
+
+def test_save_admission_rejects_before_pinning_gpu_blocks():
+    scheduler, pool, blocks, meta = _admission_case(1 / 64)
+    assert meta.requests[0].can_save is False
+    assert [b.ref_cnt for b in blocks] == [1, 1]
+    assert meta.save_drop_totals == {"block_budget": 1}
+    assert scheduler.has_pending_push_work() is False
+
+
+def test_expired_save_is_counted_once_and_held_until_all_ranks_finish():
+    scheduler, pool, blocks, meta = _admission_case(2 / 64)
+    job = meta.requests[0].store_job_id
+    assert job is not None
+    pool.free_blocks(blocks)
+    for expected_refs in (1, 0):
+        scheduler.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                    completed_saves={job: 1}, expired_saves={job}
+                )
+            )
+        )
+        assert [b.ref_cnt for b in blocks] == [expected_refs, expected_refs]
+    assert scheduler.has_pending_push_work()
+    output = SchedulerOutput.make_empty()
+    output.finished_req_ids = {"admission"}
+    totals = scheduler.build_connector_meta(output).save_drop_totals
+    assert totals == {"start_timeout": 1}
+    assert not scheduler.has_pending_push_work()
+
+
+def test_save_budget_counts_shared_blocks_until_the_last_release():
+    budget = SaveBlockBudget(1)
+    assert all(budget.acquire([7]) for _ in range(100))
+    assert not budget.acquire([8])
+    for _ in range(99):
+        budget.release([7])
+    assert not budget.acquire([8])
+    budget.release([7])
+    assert budget.acquire([8])

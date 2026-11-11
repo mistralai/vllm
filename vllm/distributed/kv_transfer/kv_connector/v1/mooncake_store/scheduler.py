@@ -22,6 +22,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.data import (  
     ReqMeta,
     RequestTracker,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.save import (
+    SaveBlockBudget,
+    SaveConfig,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.worker import (  # noqa: E501
     LookupKeyClient,
 )
@@ -192,6 +196,13 @@ class MooncakeStoreScheduler:
         self._next_store_job_id = 0
         # store_job_id -> (referenced block ids, ranks yet to report completion)
         self._pinned_saves: dict[int, tuple[list[int], int]] = {}
+        save_config = SaveConfig.from_extra_config(kvc_extra_config)
+        self._save_budget = SaveBlockBudget(
+            int(kv_cache_config.num_blocks * save_config.max_pending_blocks_ratio)
+        )
+        self._save_drops: dict[str, int] = {}
+        self._expired_save_ids: set[int] = set()
+        self._save_drop_metrics_pending = False
 
         # Per-request state
         self.load_specs: dict[str, LoadSpec] = {}  # to be loaded
@@ -502,6 +513,8 @@ class MooncakeStoreScheduler:
 
         if not self._capacity_only:
             self._reference_save_blocks(meta.requests)
+        meta.save_drop_totals = self._save_drops.copy()
+        self._save_drop_metrics_pending = False
         return meta
 
     def _apply_current_save_block_ids(
@@ -558,8 +571,6 @@ class MooncakeStoreScheduler:
                         + coord.num_hash_lookahead_tokens
                     ]
                 )
-            req_meta.store_job_id = store_job_id = self._next_store_job_id
-            self._next_store_job_id += 1
             block_ids = [put.block_id for put in req_meta.boundary_puts or []]
             assert NULL_BLOCK_ID not in block_ids, (
                 "A null block cannot back a boundary put"
@@ -577,10 +588,27 @@ class MooncakeStoreScheduler:
             # block table. Take and release exactly one reference per block.
             block_ids = list(dict.fromkeys(block_ids))
             assert NULL_BLOCK_ID not in block_ids
-            if not block_ids:
-                continue
-            self._pinned_saves[store_job_id] = (block_ids, self._num_workers)
-            pool.touch([pool.blocks[block_id] for block_id in block_ids])
+            if not self._pin_save_blocks(req_meta, block_ids):
+                req_meta.can_save = False
+
+    def _pin_save_blocks(self, req_meta: ReqMeta, block_ids: list[int]) -> bool:
+        pool = self._gpu_block_pool
+        assert pool is not None, "GPU block pool must be bound before save admission"
+        if not block_ids:
+            return False
+        if not self._save_budget.acquire(block_ids):
+            self._record_save_drop("block_budget")
+            logger.debug("Skipping save for %s: pending save budget", req_meta.req_id)
+            return False
+        req_meta.store_job_id = store_job_id = self._next_store_job_id
+        self._next_store_job_id += 1
+        self._pinned_saves[store_job_id] = (block_ids, self._num_workers)
+        pool.touch([pool.blocks[block_id] for block_id in block_ids])
+        return True
+
+    def _record_save_drop(self, reason: str) -> None:
+        self._save_drops[reason] = self._save_drops.get(reason, 0) + 1
+        self._save_drop_metrics_pending = True
 
     def register_finished_lookahead_save(
         self,
@@ -685,12 +713,8 @@ class MooncakeStoreScheduler:
             "GPU block pool must be bound before a finish-time handoff"
         )
         assert request.request_id not in self._finished_partial_tail_metas
-        store_job_id = self._next_store_job_id
-        self._next_store_job_id += 1
-        self._pinned_saves[store_job_id] = (pinned_block_ids, self._num_workers)
-        pool.touch([pool.blocks[block_id] for block_id in pinned_block_ids])
-
-        req_meta.store_job_id = store_job_id
+        if not self._pin_save_blocks(req_meta, pinned_block_ids):
+            return False
         self._finished_partial_tail_metas[request.request_id] = req_meta
         tracker.has_pending_offload = True
         # The store job owns exact block refs, so request cleanup need not wait.
@@ -758,6 +782,13 @@ class MooncakeStoreScheduler:
             return
         pool = self._gpu_block_pool
         assert pool is not None
+        for store_job_id in meta.expired_saves:
+            if (
+                store_job_id in self._pinned_saves
+                and store_job_id not in self._expired_save_ids
+            ):
+                self._expired_save_ids.add(store_job_id)
+                self._record_save_drop("start_timeout")
         for store_job_id, count in meta.completed_saves.items():
             pinned = self._pinned_saves.get(store_job_id)
             if pinned is None:
@@ -772,6 +803,8 @@ class MooncakeStoreScheduler:
                 f"store job {store_job_id} reported by too many ranks"
             )
             del self._pinned_saves[store_job_id]
+            self._expired_save_ids.discard(store_job_id)
+            self._save_budget.release(block_ids)
             # Tail-first, as elsewhere, so the shared prefix is evicted last.
             pool.free_blocks(pool.blocks[bid] for bid in reversed(block_ids))
 
@@ -783,7 +816,7 @@ class MooncakeStoreScheduler:
         held indefinitely. Nothing else keeps it alive now that a finishing
         request no longer defers its own free.
         """
-        return bool(self._pinned_saves)
+        return bool(self._pinned_saves) or self._save_drop_metrics_pending
 
     def reset_store(self) -> bool:
         """Trigger a global `remove_all(force=True)` on the Mooncake master.

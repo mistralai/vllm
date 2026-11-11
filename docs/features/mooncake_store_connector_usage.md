@@ -351,12 +351,52 @@ This bounds the scheduler's wait for prefix lookup. It does not cancel a master
 RPC already running inside the worker or apply to KV loads and saves. Store
 reset waits at most 60 seconds.
 
+### Save admission and queue timeout
+
+Optional cache saves hold at most `max_pending_blocks_ratio` of the engine's
+GPU KV blocks (default `0.1`). The budget includes queued and active saves,
+counts shared block IDs once, and rounds down to a whole number of blocks.
+A save exceeding the budget is skipped before acquiring additional GPU
+references. Setting the ratio to `0` disables saves; reads still work.
+
+A queued save that has not started within `save_start_timeout_s` (default
+`10.0` seconds) is discarded. This is a queue start deadline, not a timeout
+for native I/O already running. Active saves keep their GPU references until
+all workers finish, even when a queued save expires on another rank. There
+is no separate limit on the number of queued jobs.
+
+Configure both settings in `kv_connector_extra_config`:
+
+```json
+{
+    "kv_connector_extra_config": {
+        "max_pending_blocks_ratio": 0.1,
+        "save_start_timeout_s": 10.0
+    }
+}
+```
+
+The Prometheus counter `vllm:mooncake_store_save_jobs_dropped_total` counts
+logical save jobs once per engine, with `reason="block_budget"` or
+`reason="start_timeout"`. A timeout on any worker counts that job once;
+other workers may already have started saving it. These are skipped cache
+writes, not failed inference requests, keys, or blocks. SDK operation failures
+remain in the existing operation and failed-key counters.
+
+For a Grafana panel showing dropped jobs over the last five minutes:
+
+```promql
+sum by (reason) (increase(vllm:mooncake_store_save_jobs_dropped_total[5m]))
+```
+
 ### kv_connector_extra_config
 
 - `load_async` (bool): Enable asynchronous loading for better compute-I/O overlap. Default: `true`.
 - `lookup_async` (bool): Run the external prefix-cache lookup on a background thread without waiting for its result. With a positive `lookup_prefetch_limit`, lookup starts as soon as the request is added to the scheduler, so it overlaps the time the request waits in the queue. GPU KV allocation and loading still happen through the scheduler. Default: `false`.
 - `lookup_prefetch_limit` (int): Maximum number of arrival-time lookups in flight. Beyond it, a request is looked up when the scheduler first reaches it; scheduler lookups are not capped. Set to a positive value to enable arrival-time lookup. Default: `0` (disabled).
 - `lookup_prefetch_ttl_s` (float): Maximum age of a completed async lookup result, measured from when its RPC returned. Older results are looked up again, as are lookups whose token/hash range changed. Pending lookups use the separate lookup timeout above. Default: `2.0` seconds.
+- `max_pending_blocks_ratio` (float): Fraction of GPU KV blocks that queued and active saves may hold. Default: `0.1`; valid range: `[0, 1]`.
+- `save_start_timeout_s` (float): Maximum queued wait before a save starts. Default: `10.0` seconds; must be finite and positive. Does not cancel active native I/O.
 - `lookup_timeout_s` (float): Maximum wait for a prefix lookup, including executor queue time. Default: `1.0` seconds.
 - `lookup_rpc_port` (int): Custom port for the ZMQ lookup RPC socket. Default: `0`.
 - `custom_mem_pool` (str): Optional Mooncake allocator for the GPU KV cache.
