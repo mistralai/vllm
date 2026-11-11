@@ -528,6 +528,10 @@ class KVTransferThread(threading.Thread):
         return events
 
 
+_SAVE_BREAKER_FAILURE_THRESHOLD = 3
+_SAVE_BREAKER_COOLDOWN_S = 30.0
+
+
 class KVCacheStoreSendingThread(KVTransferThread):
     """Background thread for storing KV cache blocks to the store."""
 
@@ -598,9 +602,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.request_queue: SaveQueue = SaveQueue(config)
         self.save_circuit_breaker = CircuitBreaker(
             "Mooncake save",
-            config.save_cooldown_s,
-            config.save_failure_threshold,
-            probe_window_s=config.save_cooldown_s,
+            _SAVE_BREAKER_COOLDOWN_S,
+            _SAVE_BREAKER_FAILURE_THRESHOLD,
+            probe_window_s=config.save_start_timeout_s,
         )
         self._breaker_skipped_saves: set[int] = set()
         # Only the serial sender changes the outcome of the active job.

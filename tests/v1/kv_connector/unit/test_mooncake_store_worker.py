@@ -2183,7 +2183,7 @@ def test_cached_save_does_not_clear_put_failures(monkeypatch) -> None:
     assert sender.save_circuit_breaker.is_open
     store.batch_is_exist.return_value = [0, 0]
     store.batch_put_from_multi_buffers.return_value = [0, 0]
-    now[0] = 62.0
+    now[0] = 42.0
     _run_store_req(sender, _make_store_req("write-probe", [b"a0", b"a1"]))
     assert not sender.save_circuit_breaker.is_open
     assert store.batch_put_from_multi_buffers.call_count == 4
@@ -2217,7 +2217,7 @@ def test_expired_queued_save_completes_while_active_put_keeps_running(monkeypatc
 
     store.batch_put_from_multi_buffers.side_effect = blocked_put
     sender = _make_store_sending_thread(
-        store, save_config=SaveConfig(save_start_timeout_s=1, save_failure_threshold=1)
+        store, save_config=SaveConfig(save_start_timeout_s=1)
     )
     active = _make_store_req("active", [b"a0", b"a1"])
     active.store_job_id = 1
@@ -2242,8 +2242,12 @@ def test_expired_queued_save_completes_while_active_put_keeps_running(monkeypatc
         thread.join(3)
     assert not thread.is_alive()
     assert sender.take_completed_saves() == {1: 1}
-    assert sender.save_circuit_breaker.is_open
+    assert not sender.save_circuit_breaker.is_open
     assert sender.request_queue.unfinished_tasks == 0
+    for i, is_open in ((3, False), (4, True)):
+        _run_store_req(sender, _make_store_req(f"failed-{i}", [b"a0", b"a1"]))
+        assert store.batch_put_from_multi_buffers.call_count == i - 1
+        assert sender.save_circuit_breaker.is_open is is_open
 
 
 def test_save_drop_metrics_deduplicate_totals_across_reports():
