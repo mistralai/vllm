@@ -2088,6 +2088,7 @@ def test_failed_put_still_completes_save(error: int) -> None:
 
     _run_store_req(thread, req)
 
+    assert store.batch_put_from_multi_buffers.call_count == 1
     assert thread.take_completed_saves() == {req.store_job_id: 1}
     assert stats.reduce()["save_put_failed_keys"] == 2
     assert stats.data["save_put"][0]["status"] != "ok"
