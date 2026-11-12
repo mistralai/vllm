@@ -378,7 +378,7 @@ Configure both settings in `kv_connector_extra_config`:
 
 The Prometheus counter `vllm:mooncake_store_save_jobs_dropped_total` counts
 logical save jobs once per engine, with `reason="block_budget"` or
-`reason="start_timeout"` or `reason="circuit_breaker"`. A drop on any worker counts that job once;
+`reason="start_timeout"`. A timeout on any worker counts that job once;
 other workers may already have started saving it. These are skipped cache
 writes, not failed inference requests, keys, or blocks. SDK operation failures
 remain in the existing operation and failed-key counters.
@@ -388,31 +388,6 @@ For a Grafana panel showing dropped jobs over the last five minutes:
 ```promql
 sum by (reason) (increase(vllm:mooncake_store_save_jobs_dropped_total[5m]))
 ```
-
-### Save circuit breaker
-
-Each worker has its own save breaker, separate from prefix lookup. Like the
-lookup client, it uses fixed defaults of 3 failed jobs and a 30-second cooldown.
-Skipped jobs make no SDK existence or PUT calls and report completion, releasing their GPU references once all
-ranks finish. The dropped-job metric uses `reason="circuit_breaker"`.
-
-An existence-check error, PUT exception, or negative per-key result counts as
-one failure for that job, including partial failures. A successful existence
-check or boundary PUT cannot erase a later PUT failure in the same job. A job
-whose SDK calls succeed and which performs a PUT resets the breaker. Jobs
-satisfied entirely by existing keys do not establish write recovery.
-
-After cooldown, the next eligible job probes the store. A successful write
-closes the breaker; a failed probe starts another cooldown. A probe that finds
-only cached keys leaves writes unverified, so another probe can run after the
-`save_start_timeout_s` probe window (default `10.0` seconds), matching the lookup
-client's use of its timeout as the probe window. Queue expiry, budget rejection,
-and jobs that never reach the SDK do not count as store failures.
-
-The combined flow is: scheduler block-budget admission, worker queue expiry,
-save-breaker check before SDK calls, existence check, then PUT. Active native
-I/O is not cancelled or timed out by this breaker. It opens only after failures
-return, while the block budget continues to bound references held by saves.
 
 ### kv_connector_extra_config
 
