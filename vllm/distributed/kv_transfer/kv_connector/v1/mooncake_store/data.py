@@ -401,11 +401,13 @@ class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
 
     completed_saves: dict[int, int] = field(default_factory=dict)
     dropped_saves: dict[int, str] = field(default_factory=dict)
+    read_failures: int = 0
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
     ) -> "MooncakeStoreWorkerMetadata":
         assert isinstance(other, MooncakeStoreWorkerMetadata)
+        self.read_failures += other.read_failures
         for job, reason in other.dropped_saves.items():
             self.dropped_saves.setdefault(job, reason)
         for store_job_id, count in other.completed_saves.items():

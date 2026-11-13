@@ -2157,3 +2157,25 @@ def test_failed_save_releases_hbm_only_after_every_worker_finishes():
         assert store.batch_put_from_multi_buffers.call_count == 1
         assert sender._saved_offset.get(request.req_id, 0) == 0
     assert not scheduler.has_pending_push_work()
+
+
+def test_read_recovery_uses_successful_aggregated_load_completion():
+    scheduler = _make_bare_scheduler()
+    scheduler._pending_load_blocks = {"failed": 2, "healthy": 2}
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=MooncakeStoreWorkerMetadata(read_failures=1),
+        )
+    )
+    assert scheduler.client.read_outcomes == [(1, 0)]
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            finished_recving={"failed"},
+            failed_recving={"failed"},
+        )
+    )
+    assert scheduler.client.read_outcomes == [(1, 0)]
+    assert scheduler._pending_load_blocks == {"healthy": 2}
+    scheduler.update_connector_output(KVConnectorOutput(finished_recving={"healthy"}))
+    assert scheduler.client.read_outcomes == [(1, 0), (0, 1)]
+    assert not scheduler._pending_load_blocks

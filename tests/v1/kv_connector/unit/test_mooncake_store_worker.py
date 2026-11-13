@@ -2079,12 +2079,11 @@ def test_store_sending_thread_reports_job_when_store_raises(failing_call):
     store.batch_is_exist.return_value = [0, 0]
     getattr(store, failing_call).side_effect = RuntimeError("mooncake down")
     thread = _make_store_sending_thread(store)
-    req = _make_store_req("req-a", [b"a0", b"a1"])
-
-    with contextlib.suppress(RuntimeError):
+    for index in range(3):
+        req = _make_store_req(f"failed-{index}", [b"a0", b"a1"])
         _run_store_req(thread, req)
-
-    assert thread.take_completed_saves() == {req.store_job_id: 1}
+        assert thread.take_completed_saves() == {req.store_job_id: 1}
+    assert thread.store_service.save_breaker.is_open
 
 
 @pytest.mark.parametrize("boundary_save", [False, True])
@@ -2128,6 +2127,76 @@ def test_failed_put_still_completes_save(results: list[int]) -> None:
     assert stats.reduce()["save_put_failed_keys"] == 2
     assert stats.data["save_put"][0]["status"] != "ok"
     assert thread._saved_offset.get(req.req_id, 0) == 0
+
+
+def test_save_breaker_backoff_and_recovery(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    store = MagicMock()
+    store.batch_is_exist.side_effect = [[0, 0], [1, 1], [0, 0], [0, 0]]
+    store.batch_put_from_multi_buffers.return_value = [-900, -900]
+    sender = _make_store_sending_thread(store)
+    jobs = []
+    for index in range(5):
+        request = _make_store_req(f"queued-{index}", [b"a0", b"a1"])
+        request.store_job_id = next(_TEST_SAVE_SEQ)
+        jobs.append(request)
+        sender.add_request(request)
+    for _request in jobs:
+        sender._handle_request(sender.request_queue.get())
+    assert store.batch_put_from_multi_buffers.call_count == 3
+    assert sender.take_completed_saves() == {
+        request.store_job_id: 1 for request in jobs
+    }
+    assert sender.take_dropped_saves() == {jobs[-1].store_job_id: "circuit_breaker"}
+    store.batch_get_into_multi_buffers.return_value = [256]
+    assert sender.store_service.get(["key"], [[0x1000]], [[256]]) == [256]
+    now[0] = 29.0
+    rejected = _make_store_req("cooldown", [b"a0", b"a1"])
+    _run_store_req(sender, rejected)
+    assert sender.request_queue.empty()
+    assert sender.take_dropped_saves() == {rejected.store_job_id: "circuit_breaker"}
+    now[0] = 31.0
+    store.batch_is_exist.side_effect = None
+    store.batch_is_exist.return_value = [1, 1]
+    _run_store_req(sender, _make_store_req("cached-probe", [b"a0", b"a1"]))
+    assert sender.store_service.save_breaker.is_open
+    now[0] = 42.0
+    store.batch_is_exist.return_value = [0, 0]
+    _run_store_req(sender, _make_store_req("failed-probe", [b"a0", b"a1"]))
+    now[0] = 53.0
+    skipped = _make_store_req("probe-cooldown", [b"a0", b"a1"])
+    _run_store_req(sender, skipped)
+    assert sender.take_dropped_saves() == {skipped.store_job_id: "circuit_breaker"}
+    sender.take_completed_saves()
+    now[0] = 73.0
+    probe = _make_store_req("probe", [b"a0", b"a1"])
+    with _blocked_sdk(
+        store,
+        "batch_put_from_multi_buffers",
+        [0, 0],
+        lambda: _run_store_req(sender, probe),
+    ):
+        now[0] = 84.0
+        rejected = _make_store_req("probe-arrival", [b"a0", b"a1"])
+        _run_store_req(sender, rejected)
+        assert sender.take_completed_saves() == {rejected.store_job_id: 1}
+        assert sender.store_service.save_breaker.is_open
+    assert sender.take_completed_saves() == {probe.store_job_id: 1}
+    assert not sender.store_service.save_breaker.is_open
+
+
+def test_boundary_success_does_not_mask_regular_put_failure() -> None:
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.side_effect = [[0, 0], [-900, -900]] * 3
+    sender = _make_store_sending_thread(store)
+    for i in range(3):
+        req = _make_store_req(f"mixed-{i}", [b"a0", b"a1"])
+        req.boundary_puts = [BoundaryPut(0, 1, 16), BoundaryPut(0, 2, 32)]
+        _run_store_req(sender, req)
+    assert sender.store_service.save_breaker.is_open
+    assert store.batch_put_from_multi_buffers.call_count == 6
 
 
 def test_save_queue_overflow_and_expiry_leave_active_put_held(monkeypatch):
@@ -2177,7 +2246,12 @@ def test_save_drop_metrics_deduplicate_totals_across_reports():
     stats.record_save_drop_totals({"block_budget": 2}, recorded)
     metrics.observe(stats.to_dict())
     stats.reset()
-    totals = {"block_budget": 2, "start_timeout": 1, "queue_overflow": 1}
+    totals = {
+        "block_budget": 2,
+        "start_timeout": 1,
+        "queue_overflow": 1,
+        "circuit_breaker": 1,
+    }
     stats.record_save_drop_totals(totals, recorded)
     stats.record_save_drop_totals(totals, recorded)
     assert stats.reduce() == {
@@ -6726,3 +6800,23 @@ def test_aborted_request_keeps_hbm_until_native_get_returns(monkeypatch):
     )
     assert all(block.ref_cnt == 0 for block in blocks)
     assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free_before
+
+
+def test_read_breaker_distinguishes_misses_and_rejects_stale_recovery():
+    store = MagicMock()
+    store.batch_is_exist.return_value = [1]
+    service = worker.MooncakeStoreService(store, MooncakeStoreService.SaveConfig())
+    for code in (-400, -704, -400, -704):
+        store.batch_get_into_multi_buffers.return_value = [code]
+        assert service.get(["key"], [[0x1000]], [[256]]) == [code]
+    store.batch_get_into_multi_buffers.return_value = [-900]
+    run = lambda: service.get(["old"], [[0x1000]], [[256]])
+    with _blocked_sdk(store, "batch_get_into_multi_buffers", [256], run, keys=["old"]):
+        for _ in range(3):
+            assert service.lookup_exists(["key"], store.batch_is_exist) == [1]
+            assert service.get(["key"], [[0x2000]], [[256]]) == [-900]
+        assert service.read_breaker.is_open
+    assert service.read_breaker.is_open
+    with pytest.raises(worker.CacheUnavailable):
+        service.lookup_exists(["key"], store.batch_is_exist)
+    assert service.take_read_failures() == 3

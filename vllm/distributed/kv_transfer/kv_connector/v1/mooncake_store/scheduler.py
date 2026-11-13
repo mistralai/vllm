@@ -817,9 +817,15 @@ class MooncakeStoreScheduler:
             set(connector_output.finished_recving or ())
             & self._pending_load_blocks.keys()
         )
+        successful_loads = completed_loads - connector_output.failed_recving
         for req_id in completed_loads:
             self._pending_load_blocks.pop(req_id)
         meta = connector_output.kv_connector_worker_meta
+        read_failures = (
+            meta.read_failures if isinstance(meta, MooncakeStoreWorkerMetadata) else 0
+        )
+        if read_failures or successful_loads:
+            self.client.record_read_outcomes(read_failures, len(successful_loads))
         if not isinstance(meta, MooncakeStoreWorkerMetadata):
             return
         pool = self._gpu_block_pool

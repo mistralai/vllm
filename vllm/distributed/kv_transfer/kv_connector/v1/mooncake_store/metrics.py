@@ -134,7 +134,12 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
         )
 
         for values in per_engine_labelvalues.values():
-            for reason in ("block_budget", "start_timeout", "queue_overflow"):
+            for reason in (
+                "block_budget",
+                "start_timeout",
+                "queue_overflow",
+                "circuit_breaker",
+            ):
                 self._counter_save_drops.labels(*values, reason)
 
         self._histogram_operation_time = self._histogram_cls(
