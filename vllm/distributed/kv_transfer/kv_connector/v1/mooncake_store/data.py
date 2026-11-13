@@ -307,8 +307,6 @@ class ReqMeta:
     # Set on the save that first covers the whole prompt, so the scheduler
     # publishes the prompt's partial tail once rather than on every save.
     publish_partial_tail: bool = False
-    # Assigned on worker enqueue; never interpreted on another host.
-    save_start_deadline: float | None = None
 
     @staticmethod
     def from_request_tracker(
@@ -424,7 +422,6 @@ class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
         preempted_req_ids: set[str],
     ):
         self.requests: list[ReqMeta] = []
-        self.save_drop_totals: dict[str, int] = {}
         self.unfinished_request_ids = unfinished_request_ids
         self.preempted_req_ids = preempted_req_ids
 

@@ -35,12 +35,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.data import (
     ReqMeta,
     RequestTracker,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.metrics import (
+    MooncakeStoreConnectorStats,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.scheduler import (
     MooncakeStoreScheduler,
     _partial_tail_non_mamba_puts,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.store_service import (
-    MooncakeStoreService,
+    _PendingBlockBudget,
 )
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.block_pool import BlockPool
@@ -94,11 +95,9 @@ def _make_bare_scheduler(
     scheduler._num_workers = 1
     scheduler._next_store_job_id = 0
     scheduler._pinned_saves = {}
-    scheduler._save_budget = MooncakeStoreService.SaveBlockBudget(max_pending_blocks)
-    scheduler._pending_load_blocks = {}
-    scheduler._save_drops = {}
+    scheduler._budget = _PendingBlockBudget(max_pending_blocks)
     scheduler._dropped_save_ids = set()
-    scheduler._save_drop_metrics_pending = False
+    scheduler._stats = MooncakeStoreConnectorStats()
     scheduler._boundary_state_group_ids = frozenset({1})
     scheduler._store_coord = MooncakeStoreCoordinator(
         [
@@ -2010,7 +2009,9 @@ def test_save_admission_rejects_before_pinning_gpu_blocks():
     scheduler, pool, blocks, meta = _scheduled_save_case(1 / 64)
     assert meta.requests[0].can_save is False
     assert [b.ref_cnt for b in blocks] == [1, 1]
-    assert meta.save_drop_totals == {"block_budget": 1}
+    stats = scheduler.get_kv_connector_stats()
+    assert stats is not None
+    assert stats.reduce() == {"save_jobs_dropped_block_budget": 1}
     assert scheduler.has_pending_push_work() is False
 
 
@@ -2031,23 +2032,21 @@ def test_dropped_save_is_counted_once_and_held_until_all_ranks_finish():
             )
         )
         assert [b.ref_cnt for b in blocks] == [expected_refs, expected_refs]
-    assert scheduler.has_pending_push_work()
-    output = SchedulerOutput.make_empty()
-    output.finished_req_ids = {"admission"}
-    totals = scheduler.build_connector_meta(output).save_drop_totals
-    assert totals == {reason: 1}
+    stats = scheduler.get_kv_connector_stats()
+    assert stats is not None
+    assert stats.reduce() == {f"save_jobs_dropped_{reason}": 1}
     assert not scheduler.has_pending_push_work()
 
 
 def test_save_budget_counts_shared_blocks_until_the_last_release():
-    budget = MooncakeStoreService.SaveBlockBudget(1)
-    assert budget.acquire([7])
-    assert budget.acquire([7])
-    assert not budget.acquire([8])
-    budget.release([7])
-    assert not budget.acquire([8])
-    budget.release([7])
-    assert budget.acquire([8])
+    budget = _PendingBlockBudget(1)
+    assert budget.acquire_save([7])
+    assert budget.acquire_save([7])
+    assert not budget.acquire_save([8])
+    budget.release_save([7])
+    assert not budget.acquire_save([8])
+    budget.release_save([7])
+    assert budget.acquire_save([8])
 
 
 def test_load_and_save_share_hbm_budget_until_receive_completes():

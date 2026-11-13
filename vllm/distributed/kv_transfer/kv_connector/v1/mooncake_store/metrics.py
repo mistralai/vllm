@@ -60,7 +60,7 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
             if operation == "save_drops":
                 for record in records:
                     key = f"save_jobs_dropped_{record['reason']}"
-                    reduced[key] = int(reduced.get(key, 0)) + int(record["count"])
+                    reduced[key] = int(reduced.get(key, 0)) + 1
                 continue
             durations = [float(record["duration_seconds"]) for record in records]
             reduced[f"{operation}_count"] = len(records)
@@ -102,16 +102,9 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
             }
         )
 
-    def record_save_drop_totals(
-        self, totals: dict[str, int], recorded: dict[str, int]
-    ) -> None:
-        for reason, total in totals.items():
-            previous = recorded.get(reason, 0)
-            if total > previous:
-                self.data.setdefault("save_drops", []).append(
-                    {"reason": reason, "count": total - previous}
-                )
-                recorded[reason] = total
+    def record_save_drop(self, reason: str) -> None:
+        """Count one logical save job skipped before it wrote anything."""
+        self.data.setdefault("save_drops", []).append({"reason": reason})
 
 
 class MooncakeStorePromMetrics(KVConnectorPromMetrics):
@@ -134,7 +127,7 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
         )
 
         for values in per_engine_labelvalues.values():
-            for reason in ("block_budget", "start_timeout", "queue_overflow"):
+            for reason in ("block_budget", "start_timeout"):
                 self._counter_save_drops.labels(*values, reason)
 
         self._histogram_operation_time = self._histogram_cls(
@@ -209,7 +202,7 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
                     values = self.per_engine_labelvalues[engine_idx] + [
                         record["reason"]
                     ]
-                    self._counter_save_drops.labels(*values).inc(int(record["count"]))
+                    self._counter_save_drops.labels(*values).inc()
                     continue
                 status = str(record["status"])
                 metrics = self._get_metrics(engine_idx, operation, status)

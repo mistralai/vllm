@@ -9,7 +9,6 @@ import math
 import queue
 import sys
 import threading
-import time
 import types
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -70,9 +69,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.metrics import 
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.scheduler import (  # noqa: E501
     _partial_tail_non_mamba_puts,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.store_service import (
-    MooncakeStoreService,
 )
 from vllm.model_executor.layers.mamba.mamba_utils import get_conv_state_layout
 from vllm.platforms import current_platform
@@ -222,7 +218,6 @@ def _make_store_sending_thread(
     kv_role: str = "kv_producer",
     enable_kv_event: bool = False,
     record_operation: Callable[..., None] | None = None,
-    save_config: MooncakeStoreService.SaveConfig | None = None,
 ) -> mooncake_store_worker.KVCacheStoreSendingThread:
     if coord is None:
         coord = _default_send_coord()
@@ -232,9 +227,7 @@ def _make_store_sending_thread(
         db.set_block_len([256])
         token_databases = [db]
     thread = mooncake_store_worker.KVCacheStoreSendingThread(
-        store_service=mooncake_store_worker.MooncakeStoreService(
-            store, save_config or MooncakeStoreService.SaveConfig()
-        ),
+        store_service=mooncake_store_worker.MooncakeStoreService(store),
         token_databases=token_databases,
         block_size=block_size,
         coord=coord,
@@ -273,9 +266,7 @@ def _make_store_recving_thread(
         hash_block_size=16,
     )
     thread = mooncake_store_worker.KVCacheStoreRecvingThread(
-        store_service=mooncake_store_worker.MooncakeStoreService(
-            store, MooncakeStoreService.SaveConfig()
-        ),
+        store_service=mooncake_store_worker.MooncakeStoreService(store),
         token_databases=[token_database],
         block_size=16,
         tp_rank=tp_rank,
@@ -319,11 +310,7 @@ def _run_store_req(thread, req_meta: ReqMeta) -> None:
     if req_meta.store_job_id is None:
         req_meta.store_job_id = next(_TEST_SAVE_SEQ)
     thread.add_request(req_meta)
-    try:
-        request = thread.request_queue.get_nowait()
-    except queue.Empty:
-        return
-    thread._handle_request(request)
+    thread._handle_request(thread.request_queue.get())
 
 
 def _make_store_req(req_id: str, block_hashes: list[bytes]) -> ReqMeta:
@@ -773,9 +760,7 @@ def test_tp_shared_receiving_reads_each_local_store_shard():
         hash_block_size=16,
     )
     thread = mooncake_store_worker.KVCacheStoreRecvingThread(
-        store_service=mooncake_store_worker.MooncakeStoreService(
-            store, MooncakeStoreService.SaveConfig()
-        ),
+        store_service=mooncake_store_worker.MooncakeStoreService(store),
         token_databases=[db],
         block_size=16,
         tp_rank=0,
@@ -2130,9 +2115,9 @@ def test_failed_put_still_completes_save(results: list[int]) -> None:
     assert thread._saved_offset.get(req.req_id, 0) == 0
 
 
-def test_save_queue_overflow_and_expiry_leave_active_put_held(monkeypatch):
+def test_queued_saves_expire_while_active_put_is_blocked(monkeypatch):
     now = [0.0]
-    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(mooncake_store_worker.time, "monotonic", lambda: now[0])
     store = MagicMock()
     store.batch_is_exist.return_value = [0, 0]
     sender = _make_store_sending_thread(store)
@@ -2141,27 +2126,23 @@ def test_save_queue_overflow_and_expiry_leave_active_put_held(monkeypatch):
     sender.add_request(active)
     run = lambda: sender._handle_request(sender.request_queue.get())
     with _blocked_sdk(store, "batch_put_from_multi_buffers", [-900, -900], run):
-        queued_ids = set()
-        for index in range(MooncakeStoreService.MAX_SAVE_QUEUE_SIZE):
-            request = _make_store_req(f"queued-{index}", [b"a0", b"a1"])
-            request.store_job_id = next(_TEST_SAVE_SEQ)
-            queued_ids.add(request.store_job_id)
-            sender.add_request(request)
-        overflow = _make_store_req("overflow", [b"a0", b"a1"])
-        overflow.store_job_id = next(_TEST_SAVE_SEQ)
-        sender.add_request(overflow)
-        assert sender.take_completed_saves() == {overflow.store_job_id: 1}
-        assert sender.take_dropped_saves() == {overflow.store_job_id: "queue_overflow"}
-        now[0] = MooncakeStoreService.SAVE_START_TIMEOUT_S + 1
-        assert sender.take_completed_saves() == dict.fromkeys(queued_ids, 1)
-        assert sender.take_dropped_saves() == dict.fromkeys(queued_ids, "start_timeout")
-        assert sender.request_queue.unfinished_tasks == 1
+        queued = _make_store_req("queued", [b"a0", b"a1"])
+        queued.store_job_id = next(_TEST_SAVE_SEQ)
+        sender.add_request(queued)
+        assert sender.take_completed_saves() == {}
+        now[0] = mooncake_store_worker._SAVE_START_TIMEOUT_S
+        assert sender.take_completed_saves() == {queued.store_job_id: 1}
+        assert sender.take_dropped_saves() == {queued.store_job_id: "start_timeout"}
         assert store.batch_put_from_multi_buffers.call_count == 1
     assert sender.take_completed_saves() == {active.store_job_id: 1}
+    # The expired job is skipped on dequeue without being reported again.
+    sender._handle_request(sender.request_queue.get())
+    assert store.batch_put_from_multi_buffers.call_count == 1
+    assert sender.take_completed_saves() == {}
     assert sender.request_queue.unfinished_tasks == 0
 
 
-def test_save_drop_metrics_deduplicate_totals_across_reports():
+def test_save_drop_metrics_count_each_reported_drop():
     registry = CollectorRegistry()
     factories = {
         cls: partial(cls, registry=registry) for cls in (Counter, Gauge, Histogram)
@@ -2172,22 +2153,16 @@ def test_save_drop_metrics_deduplicate_totals_across_reports():
         ["model"],
         {0: ["test"]},
     )
-    recorded: dict[str, int] = {}
     stats = MooncakeStoreConnectorStats()
-    stats.record_save_drop_totals({"block_budget": 2}, recorded)
-    metrics.observe(stats.to_dict())
-    stats.reset()
-    totals = {"block_budget": 2, "start_timeout": 1, "queue_overflow": 1}
-    stats.record_save_drop_totals(totals, recorded)
-    stats.record_save_drop_totals(totals, recorded)
+    for reason in ("block_budget", "block_budget", "start_timeout"):
+        stats.record_save_drop(reason)
     assert stats.reduce() == {
-        f"save_jobs_dropped_{reason}": count
-        for reason, count in totals.items()
-        if reason != "block_budget"
+        "save_jobs_dropped_block_budget": 2,
+        "save_jobs_dropped_start_timeout": 1,
     }
     metrics.observe(stats.to_dict())
     name = "vllm:mooncake_store_save_jobs_dropped_total"
-    for reason, count in totals.items():
+    for reason, count in (("block_budget", 2), ("start_timeout", 1)):
         assert (
             registry.get_sample_value(name, {"model": "test", "reason": reason})
             == count
@@ -4696,9 +4671,7 @@ def _make_bare_worker(
     worker.store.register_buffer.return_value = 0
     worker.kv_role = kv_role
     worker.can_put = kv_role in ("kv_producer", "kv_both") or save_decode_cache
-    worker.store_service = mooncake_store_worker.MooncakeStoreService(
-        worker.store, MooncakeStoreService.SaveConfig()
-    )
+    worker.store_service = mooncake_store_worker.MooncakeStoreService(worker.store)
     worker._capacity_only = False
     worker._selective_lease = None
     worker.block_size = block_size
