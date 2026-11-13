@@ -39,6 +39,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.scheduler impor
     MooncakeStoreScheduler,
     _partial_tail_non_mamba_puts,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.store_service import (
+    MooncakeStoreService,
+)
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -62,12 +65,14 @@ def _make_bare_scheduler(
     enable_partial_hash_hits: bool = False,
     kv_role: str = "kv_both",
     save_decode_cache: bool = False,
+    max_pending_blocks: int = 64,
 ) -> MooncakeStoreScheduler:
     scheduler = object.__new__(MooncakeStoreScheduler)
     scheduler.kv_role = kv_role
     scheduler.save_decode_cache = save_decode_cache
     scheduler.enable_kv_events = False
     scheduler.lookup_async = False
+    scheduler.load_async = True
     scheduler.client = _StubLookupClient(hit_tokens=0)
     scheduler.enable_lookup = True
     scheduler._capacity_only = False
@@ -89,6 +94,11 @@ def _make_bare_scheduler(
     scheduler._num_workers = 1
     scheduler._next_store_job_id = 0
     scheduler._pinned_saves = {}
+    scheduler._save_budget = MooncakeStoreService.SaveBlockBudget(max_pending_blocks)
+    scheduler._pending_load_blocks = {}
+    scheduler._save_drops = {}
+    scheduler._dropped_save_ids = set()
+    scheduler._save_drop_metrics_pending = False
     scheduler._boundary_state_group_ids = frozenset({1})
     scheduler._store_coord = MooncakeStoreCoordinator(
         [
@@ -256,8 +266,8 @@ def _preempt(scheduler: MooncakeStoreScheduler):
     return scheduler.build_connector_meta(_make_preemption_scheduler_output())
 
 
-def _make_worker_output(completed_saves: dict[int, int]) -> SimpleNamespace:
-    return SimpleNamespace(
+def _make_worker_output(completed_saves: dict[int, int]) -> KVConnectorOutput:
+    return KVConnectorOutput(
         kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
             completed_saves=completed_saves
         )
@@ -1007,6 +1017,10 @@ class _StubLookupClient:
         self.num_tokens: list[int] = []
         self.prefetched: list[tuple[str, int]] = []
         self.discarded: list[str] = []
+        self.read_outcomes: list[tuple[int, int]] = []
+
+    def record_read_outcomes(self, failures: int, successes: int) -> None:
+        self.read_outcomes.append((failures, successes))
 
     def discard(self, req_id):
         self.discarded.append(req_id)
@@ -1091,7 +1105,6 @@ def test_full_external_hit_keeps_kvpool_cached_tokens_block_aligned():
     # The worker re-derives a full external hit below the request end on an
     # existing boundary, so the scheduler receives the usable aligned hit.
     scheduler = _make_bare_scheduler()
-    scheduler.load_async = True
     scheduler.client = _StubLookupClient(hit_tokens=32)
 
     request = SimpleNamespace(
@@ -1121,7 +1134,6 @@ def test_full_external_hit_with_full_local_hit_skips_load():
     # have scheduled a 15-token load that the recv thread couldn't translate
     # into any block-aligned key.
     scheduler = _make_bare_scheduler()
-    scheduler.load_async = True
     scheduler.client = _StubLookupClient(hit_tokens=32)
 
     request = SimpleNamespace(
@@ -1143,7 +1155,6 @@ def test_partial_hash_hit_block_aligned_local_loads_partial_tail():
     # Fine-grained on (hash=4, block=16): a block-aligned local hit can pull a
     # sub-block remote hit (24 = a hash boundary inside block 1). Loads [16, 24).
     scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
-    scheduler.load_async = True
     scheduler.client = _StubLookupClient(hit_tokens=24)
 
     request = SimpleNamespace(
@@ -1168,7 +1179,6 @@ def test_partial_hash_hit_no_remote_gain_skips_load():
     # tail before calling the connector). When the remote hit does not exceed
     # that block-aligned local hit, nothing is loaded.
     scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
-    scheduler.load_async = True
     scheduler.client = _StubLookupClient(hit_tokens=16)
 
     request = SimpleNamespace(
@@ -1192,7 +1202,6 @@ def test_sub_block_prompt_looks_up_with_fine_grained():
     # not a full block), so a remote partial hit is loaded. Pre-change the
     # block-size floor returned (0, False) for such prompts.
     scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
-    scheduler.load_async = True
     scheduler.client = _StubLookupClient(hit_tokens=8)
 
     request = SimpleNamespace(
@@ -1986,13 +1995,83 @@ def test_store_job_blocks_are_released_once_every_rank_reports():
 def test_worker_metadata_aggregates_completions_across_ranks():
     # The engine merges each rank's metadata before the scheduler sees it, so a
     # job that every rank finished in one step arrives as a single count.
-    merged = MooncakeStoreWorkerMetadata(completed_saves={1: 1}).aggregate(
-        MooncakeStoreWorkerMetadata(completed_saves={1: 1, 2: 1})
+    merged = MooncakeStoreWorkerMetadata(
+        completed_saves={1: 1}, dropped_saves={1: "start_timeout"}
+    ).aggregate(
+        MooncakeStoreWorkerMetadata(
+            completed_saves={1: 1, 2: 1}, dropped_saves={1: "circuit_breaker"}
+        )
     )
     assert merged.completed_saves == {1: 2, 2: 1}
+    assert merged.dropped_saves == {1: "start_timeout"}
 
 
-def _scheduled_save_case() -> tuple[
+def test_save_admission_rejects_before_pinning_gpu_blocks():
+    scheduler, pool, blocks, meta = _scheduled_save_case(1 / 64)
+    assert meta.requests[0].can_save is False
+    assert [b.ref_cnt for b in blocks] == [1, 1]
+    assert meta.save_drop_totals == {"block_budget": 1}
+    assert scheduler.has_pending_push_work() is False
+
+
+def test_dropped_save_is_counted_once_and_held_until_all_ranks_finish():
+    reason = "start_timeout"
+    scheduler, pool, blocks, meta = _scheduled_save_case(2 / 64)
+    job = meta.requests[0].store_job_id
+    assert job is not None
+    pool.free_blocks(blocks)
+    other_reason = "block_budget"
+    for expected_refs in (1, 0):
+        scheduler.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                    completed_saves={job: 1},
+                    dropped_saves={job: reason if expected_refs else other_reason},
+                )
+            )
+        )
+        assert [b.ref_cnt for b in blocks] == [expected_refs, expected_refs]
+    assert scheduler.has_pending_push_work()
+    output = SchedulerOutput.make_empty()
+    output.finished_req_ids = {"admission"}
+    totals = scheduler.build_connector_meta(output).save_drop_totals
+    assert totals == {reason: 1}
+    assert not scheduler.has_pending_push_work()
+
+
+def test_save_budget_counts_shared_blocks_until_the_last_release():
+    budget = MooncakeStoreService.SaveBlockBudget(1)
+    assert budget.acquire([7])
+    assert budget.acquire([7])
+    assert not budget.acquire([8])
+    budget.release([7])
+    assert not budget.acquire([8])
+    budget.release([7])
+    assert budget.acquire([8])
+
+
+def test_load_and_save_share_hbm_budget_until_receive_completes():
+    scheduler = _make_bare_scheduler(max_pending_blocks=2)
+    scheduler.client = _StubLookupClient(hit_tokens=32)
+    first = SimpleNamespace(
+        request_id="first", num_tokens=48, block_hashes=[b"h0", b"h1", b"h2"]
+    )
+    second = SimpleNamespace(
+        request_id="second", num_tokens=48, block_hashes=first.block_hashes
+    )
+    assert scheduler.get_num_new_matched_tokens(first, 0) == (32, True)
+    assert scheduler.get_num_new_matched_tokens(second, 0) == (0, False)
+    request = ReqMeta("save", 16, ([1],), block_hashes=[b"h0"], can_save=True)
+    assert not scheduler._pin_save_blocks(request, [1])
+    scheduler.update_connector_output(KVConnectorOutput(finished_recving={"first"}))
+    assert scheduler.get_num_new_matched_tokens(second, 0) == (32, True)
+    scheduler.update_connector_output(KVConnectorOutput(finished_recving={"second"}))
+    assert scheduler._pin_save_blocks(request, [1])
+
+
+def _scheduled_save_case(
+    ratio: float = 1.0,
+) -> tuple[
     MooncakeStoreScheduler,
     BlockPool,
     list[KVCacheBlock],
@@ -2007,6 +2086,7 @@ def _scheduled_save_case() -> tuple[
         kv_transfer_config=KVTransferConfig(
             kv_connector="MooncakeStoreConnector",
             kv_role="kv_both",
+            kv_connector_extra_config={"max_pending_blocks_ratio": ratio},
         ),
     )
     kv_config = KVCacheConfig(
