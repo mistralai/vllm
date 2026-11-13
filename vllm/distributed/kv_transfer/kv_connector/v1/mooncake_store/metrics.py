@@ -20,6 +20,23 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetricT,
 )
 
+# Records counting skipped cache work rather than timing a Mooncake RPC, keyed
+# by record kind: (`reduce` key prefix, Prometheus name, description, reasons).
+_SKIP_RECORDS = {
+    "save_drops": (
+        "save_jobs_dropped",
+        "vllm:mooncake_store_save_jobs_dropped_total",
+        "Number of optional cache save jobs dropped per engine.",
+        ("block_budget", "start_timeout"),
+    ),
+    "load_skips": (
+        "loads_skipped",
+        "vllm:mooncake_store_loads_skipped_total",
+        "Number of requests computed locally without external KV, per engine.",
+        ("block_budget",),
+    ),
+}
+
 
 def _nearest_rank_percentile(values: list[float], percentile: float) -> float:
     if not values:
@@ -57,9 +74,10 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
         for operation, records in sorted(self.data.items()):
             if not records:
                 continue
-            if operation == "save_drops":
+            if operation in _SKIP_RECORDS:
+                prefix = _SKIP_RECORDS[operation][0]
                 for record in records:
-                    key = f"save_jobs_dropped_{record['reason']}"
+                    key = f"{prefix}_{record['reason']}"
                     reduced[key] = int(reduced.get(key, 0)) + 1
                 continue
             durations = [float(record["duration_seconds"]) for record in records]
@@ -106,6 +124,10 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
         """Count one logical save job skipped before it wrote anything."""
         self.data.setdefault("save_drops", []).append({"reason": reason})
 
+    def record_load_skip(self, reason: str) -> None:
+        """Count one request computed locally without external KV."""
+        self.data.setdefault("load_skips", []).append({"reason": reason})
+
 
 class MooncakeStorePromMetrics(KVConnectorPromMetrics):
     """Prometheus metrics for Mooncake store communication."""
@@ -120,15 +142,17 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
         super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
         metric_labelnames = labelnames + ["operation", "status"]
         self._metric_cache: dict[tuple[int, str, str], dict[str, PromMetric]] = {}
-        self._counter_save_drops = self._counter_cls(
-            name="vllm:mooncake_store_save_jobs_dropped_total",
-            documentation="Number of optional cache save jobs dropped per engine.",
-            labelnames=labelnames + ["reason"],
-        )
-
-        for values in per_engine_labelvalues.values():
-            for reason in ("block_budget", "start_timeout"):
-                self._counter_save_drops.labels(*values, reason)
+        self._skip_counters: dict[str, PromMetric] = {}
+        for operation, (_, name, documentation, reasons) in _SKIP_RECORDS.items():
+            counter = self._counter_cls(
+                name=name,
+                documentation=documentation,
+                labelnames=labelnames + ["reason"],
+            )
+            for values in per_engine_labelvalues.values():
+                for reason in reasons:
+                    counter.labels(*values, reason)
+            self._skip_counters[operation] = counter
 
         self._histogram_operation_time = self._histogram_cls(
             name="vllm:mooncake_store_operation_time_seconds",
@@ -198,11 +222,11 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
             assert isinstance(records, list)
             for record in records:
                 assert isinstance(record, dict)
-                if operation == "save_drops":
+                if operation in self._skip_counters:
                     values = self.per_engine_labelvalues[engine_idx] + [
                         record["reason"]
                     ]
-                    self._counter_save_drops.labels(*values).inc()
+                    self._skip_counters[operation].labels(*values).inc()
                     continue
                 status = str(record["status"])
                 metrics = self._get_metrics(engine_idx, operation, status)

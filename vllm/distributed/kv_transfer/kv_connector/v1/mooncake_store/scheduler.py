@@ -301,6 +301,7 @@ class MooncakeStoreScheduler:
         self._budget.release_load(request.request_id)
         if self._budget.is_full():
             self.client.discard(request.request_id)
+            self._stats.record_load_skip("block_budget")
             return 0, False
         if request.num_tokens < self._lookup_align():
             return 0, False
@@ -338,6 +339,7 @@ class MooncakeStoreScheduler:
         if not self._budget.reserve_load(request.request_id, load_blocks):
             self.client.discard(request.request_id)
             self.load_specs.pop(request.request_id, None)
+            self._stats.record_load_skip("block_budget")
             return 0, False
 
         self.load_specs[request.request_id] = LoadSpec(

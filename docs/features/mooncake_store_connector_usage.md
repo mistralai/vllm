@@ -381,6 +381,11 @@ other workers may already have started saving it. These are skipped cache
 writes, not failed inference requests, keys, or blocks. SDK operation failures
 remain in the existing operation and failed-key counters.
 
+`vllm:mooncake_store_loads_skipped_total{reason="block_budget"}` counts requests
+admitted without an external lookup or load because the budget was full. A
+rising count with normal `load_get` and `save_put` latencies points to a budget
+that is too small; rising latencies point to a slow Mooncake.
+
 For a Grafana panel showing dropped jobs over the last five minutes:
 
 ```promql

@@ -2060,6 +2060,9 @@ def test_load_and_save_share_hbm_budget_until_receive_completes():
     )
     assert scheduler.get_num_new_matched_tokens(first, 0) == (32, True)
     assert scheduler.get_num_new_matched_tokens(second, 0) == (0, False)
+    stats = scheduler.get_kv_connector_stats()
+    assert stats is not None
+    assert stats.reduce() == {"loads_skipped_block_budget": 1}
     request = ReqMeta("save", 16, ([1],), block_hashes=[b"h0"], can_save=True)
     assert not scheduler._pin_save_blocks(request, [1])
     scheduler.update_connector_output(KVConnectorOutput(finished_recving={"first"}))

@@ -2142,7 +2142,7 @@ def test_queued_saves_expire_while_active_put_is_blocked(monkeypatch):
     assert sender.request_queue.unfinished_tasks == 0
 
 
-def test_save_drop_metrics_count_each_reported_drop():
+def test_skip_metrics_count_each_reported_skip():
     registry = CollectorRegistry()
     factories = {
         cls: partial(cls, registry=registry) for cls in (Counter, Gauge, Histogram)
@@ -2156,13 +2156,18 @@ def test_save_drop_metrics_count_each_reported_drop():
     stats = MooncakeStoreConnectorStats()
     for reason in ("block_budget", "block_budget", "start_timeout"):
         stats.record_save_drop(reason)
+    stats.record_load_skip("block_budget")
     assert stats.reduce() == {
+        "loads_skipped_block_budget": 1,
         "save_jobs_dropped_block_budget": 2,
         "save_jobs_dropped_start_timeout": 1,
     }
     metrics.observe(stats.to_dict())
-    name = "vllm:mooncake_store_save_jobs_dropped_total"
-    for reason, count in (("block_budget", 2), ("start_timeout", 1)):
+    for name, reason, count in (
+        ("vllm:mooncake_store_save_jobs_dropped_total", "block_budget", 2),
+        ("vllm:mooncake_store_save_jobs_dropped_total", "start_timeout", 1),
+        ("vllm:mooncake_store_loads_skipped_total", "block_budget", 1),
+    ):
         assert (
             registry.get_sample_value(name, {"model": "test", "reason": reason})
             == count
