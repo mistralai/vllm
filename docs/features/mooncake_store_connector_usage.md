@@ -351,24 +351,23 @@ This bounds the scheduler's wait for prefix lookup. It does not cancel a master
 RPC already running inside the worker or apply to KV loads and saves. Store
 reset waits at most 60 seconds.
 
-### Save admission and queue bounds
-
-Set `kv_load_failure_policy="recompute"` in the top-level KV transfer config to
-recompute failed remote loads locally. The default `"fail"` policy terminates
-the affected requests. Both policies release buffers after transfer completion.
+### Pending transfer budget
 
 Optional cache transfers hold at most `max_pending_blocks_ratio` of the engine's
 GPU KV blocks (default `0.1`), rounded down to whole blocks. Queued and active
 saves count shared block IDs once. Remote loads reserve the whole matched
 prefix conservatively, across cache groups, until all workers finish receiving.
-A load exceeding the remaining budget falls back to local computation before
-allocating its remote prefix; an over-budget save is skipped before pinning.
+A transfer is admitted while usage is below the budget, whatever its size, so
+usage exceeds the budget by at most one transfer and a prefix larger than the
+budget can still load. Once the budget is used up, loads fall back to local
+computation before allocating their remote prefix, and saves are skipped before
+pinning.
 Setting the ratio to `0` disables both external reads and saves.
 
-Queued SAVE jobs have a fixed 5-second start deadline and a limit of 256 jobs.
-Submissions to a full queue complete immediately with reason `queue_overflow`.
-The deadline only expires unstarted work; active saves keep their GPU references
-until all workers finish. Configure the HBM budget in `kv_connector_extra_config`:
+Queued SAVE jobs not started within 5 seconds are dropped, releasing their GPU
+blocks while a slow Mooncake call holds the sending thread. Active saves keep
+their GPU references until all workers finish. Configure the HBM budget in
+`kv_connector_extra_config`:
 
 ```json
 {
@@ -379,11 +378,16 @@ until all workers finish. Configure the HBM budget in `kv_connector_extra_config
 ```
 
 The Prometheus counter `vllm:mooncake_store_save_jobs_dropped_total` counts
-logical save jobs once per engine, with `reason="block_budget"`,
-`reason="start_timeout"` or `reason="queue_overflow"`. A timeout on any worker counts that job once;
+logical save jobs once per engine, with `reason="block_budget"`
+or `reason="start_timeout"`. A timeout on any worker counts that job once;
 other workers may already have started saving it. These are skipped cache
 writes, not failed inference requests, keys, or blocks. SDK operation failures
 remain in the existing operation and failed-key counters.
+
+`vllm:mooncake_store_loads_skipped_total{reason="block_budget"}` counts requests
+admitted without an external lookup or load because the budget was full. A
+rising count with normal `load_get` and `save_put` latencies points to a budget
+that is too small; rising latencies point to a slow Mooncake.
 
 For a Grafana panel showing dropped jobs over the last five minutes:
 
@@ -637,3 +641,7 @@ To use a custom shared seed, set the same `PYTHONHASHSEED` on every instance tha
 ```bash
 PYTHONHASHSEED=<shared-value> vllm serve ...
 ```
+
+Set `kv_load_failure_policy="recompute"` in the KV transfer configuration to
+recompute failed remote loads locally. The existing `"fail"` policy terminates
+affected requests. Transfer completion is reported after synchronous SDK return.
