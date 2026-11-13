@@ -132,6 +132,10 @@ class _PendingBlockBudget:
     A slow Mooncake keeps loading requests' blocks allocated and saved blocks
     pinned. A save charges each block once, however many jobs share it; a load
     reserves its whole matched prefix until every worker has received it.
+
+    A transfer is admitted while usage is below the cap, whatever its size, so
+    a prefix larger than the whole budget can still load. Usage overshoots the
+    cap by at most one transfer.
     """
 
     def __init__(self, max_blocks: int) -> None:
@@ -146,7 +150,7 @@ class _PendingBlockBudget:
         return self._num_used() >= self.max_blocks
 
     def reserve_load(self, req_id: str, num_blocks: int) -> bool:
-        if self._num_used() + num_blocks > self.max_blocks:
+        if self.is_full():
             return False
         self._load_blocks[req_id] = num_blocks
         return True
@@ -156,8 +160,8 @@ class _PendingBlockBudget:
 
     def acquire_save(self, block_ids: Sequence[int]) -> bool:
         unique = set(block_ids)
-        new = sum(block_id not in self._save_block_refs for block_id in unique)
-        if self._num_used() + new > self.max_blocks:
+        # Re-pinning blocks already held costs nothing, even when full.
+        if not unique <= self._save_block_refs.keys() and self.is_full():
             return False
         self._save_block_refs.update(unique)
         return True

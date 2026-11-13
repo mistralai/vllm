@@ -2006,7 +2006,7 @@ def test_worker_metadata_aggregates_completions_across_ranks():
 
 
 def test_save_admission_rejects_before_pinning_gpu_blocks():
-    scheduler, pool, blocks, meta = _scheduled_save_case(1 / 64)
+    scheduler, pool, blocks, meta = _scheduled_save_case(0)
     assert meta.requests[0].can_save is False
     assert [b.ref_cnt for b in blocks] == [1, 1]
     stats = scheduler.get_kv_connector_stats()
@@ -2047,6 +2047,17 @@ def test_save_budget_counts_shared_blocks_until_the_last_release():
     assert not budget.acquire_save([8])
     budget.release_save([7])
     assert budget.acquire_save([8])
+
+
+def test_budget_admits_one_transfer_larger_than_itself():
+    budget = _PendingBlockBudget(1)
+    assert budget.reserve_load("huge", 20)
+    assert not budget.reserve_load("next", 1)
+    assert not budget.acquire_save([7])
+    budget.release_load("huge")
+    assert budget.acquire_save([7, 8, 9])
+    assert budget.acquire_save([8])
+    assert not budget.acquire_save([10])
 
 
 def test_load_and_save_share_hbm_budget_until_receive_completes():
