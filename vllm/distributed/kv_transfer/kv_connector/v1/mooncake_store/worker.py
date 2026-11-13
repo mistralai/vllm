@@ -84,6 +84,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.selective_lease
     SelectiveLookupLease,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.store_service import (
+    CacheUnavailable,
     MooncakeStoreService,
 )
 from vllm.distributed.mooncake_store import MooncakeStoreConfig, setup_mooncake_store
@@ -1252,7 +1253,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             record_operation=record_operation,
             request_queue=store_service.load_queue,
         )
-        self.store_service = store_service
         self.group_participates = (
             list(group_participates)
             if group_participates is not None
@@ -1274,6 +1274,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             )
         )
         self.coord = coord
+        self.store_service = store_service
 
     def _add_load_error_block_ids(self, block_ids: list[int]) -> None:
         with self._invalid_block_ids_lock:
@@ -1290,9 +1291,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         return failed
 
     def _report_load_error(self, req_id: str, block_ids: list[int]) -> None:
-        if self._is_hma_required:
-            self.set_failed_request(req_id)
-        else:
+        # Request-level failure survives cross-rank aggregation until every
+        # transfer is drained, including layouts with globally unique block IDs.
+        self.set_failed_request(req_id)
+        if not self._is_hma_required:
             self._add_load_error_block_ids(block_ids)
 
     def get_and_clear_block_ids_with_load_errors(self) -> set[int]:
@@ -1302,6 +1304,24 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         return invalid_block_ids
 
     def _handle_request(self, req_meta: ReqMeta):
+        try:
+            self._load_request(req_meta)
+        except Exception:
+            self._report_load_error(
+                req_meta.req_id,
+                [
+                    bid
+                    for group in req_meta.block_ids
+                    for bid in group
+                    if bid != NULL_BLOCK_ID
+                ],
+            )
+            logger.exception("Mooncake load failed for request %s", req_meta.req_id)
+        finally:
+            self.set_finished_request(req_meta.req_id)
+            self.request_queue.task_done()
+
+    def _load_request(self, req_meta: ReqMeta):
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
         mask_num = (
@@ -1359,8 +1379,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             block_id_list.extend(g_block_ids)
 
         if not key_list:
-            self.set_finished_request(req_id)
-            self.request_queue.task_done()
             return
 
         # Rotate aligned lists by tp_rank for load balancing.
@@ -1408,8 +1426,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         oversized_key_bytes,
                         self.disk_offload_buffer_budget_bytes,
                     )
-                    self.set_finished_request(req_id)
-                    self.request_queue.task_done()
                     return
                 load_batches = []
                 block_id_offset = 0
@@ -1429,9 +1445,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     block_id_offset = next_block_id_offset
 
         current_batch_keys: list[str] = key_list_c
-        current_batch_block_ids: list[int] = block_id_list_c
         batch_bytes = 0
+        load_get_start = time.perf_counter()
         try:
+            remaining_blocks = list(block_id_list_c)
             for (
                 batch_keys,
                 batch_addrs,
@@ -1439,7 +1456,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 batch_block_ids,
             ) in load_batches:
                 current_batch_keys = batch_keys
-                current_batch_block_ids = batch_block_ids
                 batch_bytes = _sum_batch_bytes(batch_sizes)
                 tiers_by_key: dict[str, str] | None = None
                 if envs.VLLM_MOONCAKE_STORE_TIER_LOG:
@@ -1468,7 +1484,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 )
                 if failed:
                     self._report_load_error(
-                        req_id, [block_id for _, _, block_id in failed]
+                        req_id,
+                        [block_id for _, _, block_id in failed]
+                        + remaining_blocks[len(batch_block_ids) :],
                     )
                     logger.warning(
                         "Failed to get %d Mooncake keys from sub-batch "
@@ -1478,8 +1496,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         [(key, value) for key, value, _ in failed[:3]],
                     )
                     break
+                remaining_blocks = remaining_blocks[len(batch_block_ids) :]
         except Exception as e:
-            self._report_load_error(req_id, current_batch_block_ids)
+            self._report_load_error(req_id, remaining_blocks)
             self._record_operation(
                 "load_get",
                 load_get_start,
@@ -1493,9 +1512,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 current_batch_keys[:3],
                 e,
             )
-
-        self.set_finished_request(req_id)
-        self.request_queue.task_done()
 
 
 # ============================================================
@@ -2576,7 +2592,7 @@ class MooncakeStoreWorker:
                 num_failed_keys=len(candidate_keys),
             )
             logger.error("Remote connection failed in lookup: %s", e)
-            return MooncakeLookupResult(0)
+            raise CacheUnavailable("Mooncake prefix lookup failed") from e
 
         # A (group, hash) is "present" only when every namespace that will be
         # loaded has it (per-group count: sharded groups need every rank's
@@ -2785,8 +2801,12 @@ class LookupKeyServer:
                     hash_len = int.from_bytes(all_frames[2], byteorder="big")
                     blob = all_frames[3].buffer
                     block_hashes = BlobBlockHashes(blob, hash_len)
-                    result = self.store_worker.lookup(num_tokens, block_hashes)
-                    self.socket.send(encode_lookup_response(result))
+                    try:
+                        result = self.store_worker.lookup(num_tokens, block_hashes)
+                        self.socket.send(encode_lookup_response(result))
+                    except Exception:
+                        logger.exception("Mooncake prefix lookup failed")
+                        self.socket.send(RESP_ERR)
 
                 elif msg_type == RESET_MSG:
                     try:
