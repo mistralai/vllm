@@ -307,6 +307,8 @@ class ReqMeta:
     # Set on the save that first covers the whole prompt, so the scheduler
     # publishes the prompt's partial tail once rather than on every save.
     publish_partial_tail: bool = False
+    # Assigned on worker enqueue; never interpreted on another host.
+    save_start_deadline: float | None = None
 
     @staticmethod
     def from_request_tracker(
@@ -398,11 +400,16 @@ class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
     """Maps `ReqMeta.store_job_id` to the number of ranks done with that job."""
 
     completed_saves: dict[int, int] = field(default_factory=dict)
+    dropped_saves: dict[int, str] = field(default_factory=dict)
+    read_failures: int = 0
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
     ) -> "MooncakeStoreWorkerMetadata":
         assert isinstance(other, MooncakeStoreWorkerMetadata)
+        self.read_failures += other.read_failures
+        for job, reason in other.dropped_saves.items():
+            self.dropped_saves.setdefault(job, reason)
         for store_job_id, count in other.completed_saves.items():
             self.completed_saves[store_job_id] = (
                 self.completed_saves.get(store_job_id, 0) + count
@@ -419,6 +426,7 @@ class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
         preempted_req_ids: set[str],
     ):
         self.requests: list[ReqMeta] = []
+        self.save_drop_totals: dict[str, int] = {}
         self.unfinished_request_ids = unfinished_request_ids
         self.preempted_req_ids = preempted_req_ids
 

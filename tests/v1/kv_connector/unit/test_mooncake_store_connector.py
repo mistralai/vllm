@@ -834,7 +834,12 @@ def test_admission_lookup_retains_completed_result_until_scheduled():
     vllm_config = create_vllm_config(
         kv_connector="MooncakeStoreConnector",
         kv_role="kv_both",
-        kv_connector_extra_config={"lookup_async": True, "lookup_prefetch_limit": 1},
+        kv_connector_extra_config={
+            "lookup_async": True,
+            "lookup_prefetch_limit": 1,
+            # Exercise lookup state with capacity for the returned prefix.
+            "max_pending_blocks_ratio": 1.0,
+        },
     )
     with (
         set_current_vllm_config(vllm_config),
@@ -1119,7 +1124,11 @@ def test_get_num_new_matched_tokens_async_defers_then_reports():
     vllm_config = create_vllm_config(
         kv_connector="MooncakeStoreConnector",
         kv_role="kv_both",
-        kv_connector_extra_config={"lookup_async": True},
+        kv_connector_extra_config={
+            "lookup_async": True,
+            # Exercise lookup state with capacity for the returned prefix.
+            "max_pending_blocks_ratio": 1.0,
+        },
     )
     kv_cache_config = _make_kv_cache_config()
 
@@ -1428,7 +1437,11 @@ def test_finish_during_prefill_saves_only_completed_kv(
     config = create_vllm_config(
         kv_connector="MooncakeStoreConnector",
         kv_role=kv_role,
-        kv_connector_extra_config={"save_decode_cache": save_decode_cache},
+        kv_connector_extra_config={
+            "save_decode_cache": save_decode_cache,
+            # This test checks completed-token boundaries, not save admission.
+            "max_pending_blocks_ratio": 1.0,
+        },
     )
     set_mtp_config(config)
     with patch.object(scheduler, "LookupKeyClient"):
