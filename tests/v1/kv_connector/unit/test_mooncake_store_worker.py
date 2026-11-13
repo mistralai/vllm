@@ -206,7 +206,7 @@ def _make_store_sending_thread(
         db.set_block_len([256])
         token_databases = [db]
     thread = mooncake_store_worker.KVCacheStoreSendingThread(
-        store=store,
+        store_service=mooncake_store_worker.MooncakeStoreService(store),
         token_databases=token_databases,
         block_size=block_size,
         coord=coord,
@@ -245,7 +245,7 @@ def _make_store_recving_thread(
         hash_block_size=16,
     )
     thread = mooncake_store_worker.KVCacheStoreRecvingThread(
-        store=store,
+        store_service=mooncake_store_worker.MooncakeStoreService(store),
         token_databases=[token_database],
         block_size=16,
         tp_rank=tp_rank,
@@ -737,7 +737,7 @@ def test_tp_shared_receiving_reads_each_local_store_shard():
         hash_block_size=16,
     )
     thread = mooncake_store_worker.KVCacheStoreRecvingThread(
-        store=store,
+        store_service=mooncake_store_worker.MooncakeStoreService(store),
         token_databases=[db],
         block_size=16,
         tp_rank=0,
@@ -4597,6 +4597,7 @@ def _make_bare_worker(
     worker.cache_config = MagicMock()
     worker.cache_config.num_gpu_blocks = num_gpu_blocks
     worker.store = MagicMock()
+    worker.store_service = mooncake_store_worker.MooncakeStoreService(worker.store)
     worker.store.register_buffer.return_value = 0
     worker.kv_role = kv_role
     worker.can_put = kv_role in ("kv_producer", "kv_both") or save_decode_cache
@@ -4610,7 +4611,6 @@ def _make_bare_worker(
     worker.kv_send_thread = None
     worker.kv_recv_threads = []
     worker.num_recv_threads = 1
-    worker.recv_request_queue = queue.Queue()
     worker._device_regions = {}
     worker._released_regions = set()
     worker.finished_store_req = set()
@@ -5700,7 +5700,7 @@ def test_start_load_kv_queues_async_load():
     w.start_load_kv(meta)
 
     assert req.load_spec.token_len == 32
-    assert w.recv_request_queue.get_nowait() is req
+    assert w.store_service.load_queue.get_nowait() is req
 
 
 def test_putting_consumer_queues_decode_save():
