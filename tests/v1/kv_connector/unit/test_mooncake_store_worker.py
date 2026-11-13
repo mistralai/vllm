@@ -9,15 +9,18 @@ import math
 import queue
 import sys
 import threading
+import time
 import types
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 from tests.v1.attention.utils import dense_kv_cache_views
 from tests.v1.core.utils import create_requests, create_scheduler, mock_kv
@@ -29,6 +32,7 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
     sliding_window_layer,
 )
 from tests.v1.kv_connector.unit.utils import create_model_runner_output
+from vllm.config import DeviceConfig, VllmConfig
 from vllm.distributed import mooncake_store
 from vllm.distributed.kv_events import KVEventAggregator
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
@@ -62,9 +66,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.layout import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.metrics import (
     MooncakeStoreConnectorStats,
+    MooncakeStorePromMetrics,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.scheduler import (  # noqa: E501
     _partial_tail_non_mamba_puts,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.store_service import (
+    MooncakeStoreService,
 )
 from vllm.model_executor.layers.mamba.mamba_utils import get_conv_state_layout
 from vllm.platforms import current_platform
@@ -214,6 +222,7 @@ def _make_store_sending_thread(
     kv_role: str = "kv_producer",
     enable_kv_event: bool = False,
     record_operation: Callable[..., None] | None = None,
+    save_config: MooncakeStoreService.SaveConfig | None = None,
 ) -> mooncake_store_worker.KVCacheStoreSendingThread:
     if coord is None:
         coord = _default_send_coord()
@@ -223,7 +232,9 @@ def _make_store_sending_thread(
         db.set_block_len([256])
         token_databases = [db]
     thread = mooncake_store_worker.KVCacheStoreSendingThread(
-        store_service=mooncake_store_worker.MooncakeStoreService(store),
+        store_service=mooncake_store_worker.MooncakeStoreService(
+            store, save_config or MooncakeStoreService.SaveConfig()
+        ),
         token_databases=token_databases,
         block_size=block_size,
         coord=coord,
@@ -262,7 +273,9 @@ def _make_store_recving_thread(
         hash_block_size=16,
     )
     thread = mooncake_store_worker.KVCacheStoreRecvingThread(
-        store_service=mooncake_store_worker.MooncakeStoreService(store),
+        store_service=mooncake_store_worker.MooncakeStoreService(
+            store, MooncakeStoreService.SaveConfig()
+        ),
         token_databases=[token_database],
         block_size=16,
         tp_rank=tp_rank,
@@ -306,7 +319,11 @@ def _run_store_req(thread, req_meta: ReqMeta) -> None:
     if req_meta.store_job_id is None:
         req_meta.store_job_id = next(_TEST_SAVE_SEQ)
     thread.add_request(req_meta)
-    thread._handle_request(thread.request_queue.get())
+    try:
+        request = thread.request_queue.get_nowait()
+    except queue.Empty:
+        return
+    thread._handle_request(request)
 
 
 def _make_store_req(req_id: str, block_hashes: list[bytes]) -> ReqMeta:
@@ -756,7 +773,9 @@ def test_tp_shared_receiving_reads_each_local_store_shard():
         hash_block_size=16,
     )
     thread = mooncake_store_worker.KVCacheStoreRecvingThread(
-        store_service=mooncake_store_worker.MooncakeStoreService(store),
+        store_service=mooncake_store_worker.MooncakeStoreService(
+            store, MooncakeStoreService.SaveConfig()
+        ),
         token_databases=[db],
         block_size=16,
         tp_rank=0,
@@ -1844,6 +1863,7 @@ def test_worker_meta_is_absent_before_any_completed_job():
     send_thread = _make_partial_tail_send_thread(MagicMock())
     store_worker = object.__new__(mooncake_store_worker.MooncakeStoreWorker)
     store_worker.kv_send_thread = send_thread
+    store_worker.store_service = send_thread.store_service
 
     assert store_worker.build_connector_worker_meta() is None
 
@@ -2059,12 +2079,11 @@ def test_store_sending_thread_reports_job_when_store_raises(failing_call):
     store.batch_is_exist.return_value = [0, 0]
     getattr(store, failing_call).side_effect = RuntimeError("mooncake down")
     thread = _make_store_sending_thread(store)
-    req = _make_store_req("req-a", [b"a0", b"a1"])
-
-    with contextlib.suppress(RuntimeError):
+    for index in range(3):
+        req = _make_store_req(f"failed-{index}", [b"a0", b"a1"])
         _run_store_req(thread, req)
-
-    assert thread.take_completed_saves() == {req.store_job_id: 1}
+        assert thread.take_completed_saves() == {req.store_job_id: 1}
+    assert thread.store_service.save_breaker.is_open
 
 
 @pytest.mark.parametrize("boundary_save", [False, True])
@@ -2108,6 +2127,145 @@ def test_failed_put_still_completes_save(results: list[int]) -> None:
     assert stats.reduce()["save_put_failed_keys"] == 2
     assert stats.data["save_put"][0]["status"] != "ok"
     assert thread._saved_offset.get(req.req_id, 0) == 0
+
+
+def test_save_breaker_backoff_and_recovery(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    store = MagicMock()
+    store.batch_is_exist.side_effect = [[0, 0], [1, 1], [0, 0], [0, 0]]
+    store.batch_put_from_multi_buffers.return_value = [-900, -900]
+    sender = _make_store_sending_thread(store)
+    jobs = []
+    for index in range(5):
+        request = _make_store_req(f"queued-{index}", [b"a0", b"a1"])
+        request.store_job_id = next(_TEST_SAVE_SEQ)
+        jobs.append(request)
+        sender.add_request(request)
+    for _request in jobs:
+        sender._handle_request(sender.request_queue.get())
+    assert store.batch_put_from_multi_buffers.call_count == 3
+    assert sender.take_completed_saves() == {
+        request.store_job_id: 1 for request in jobs
+    }
+    assert sender.take_dropped_saves() == {jobs[-1].store_job_id: "circuit_breaker"}
+    store.batch_get_into_multi_buffers.return_value = [256]
+    assert sender.store_service.get(["key"], [[0x1000]], [[256]]) == [256]
+    now[0] = 29.0
+    rejected = _make_store_req("cooldown", [b"a0", b"a1"])
+    _run_store_req(sender, rejected)
+    assert sender.request_queue.empty()
+    assert sender.take_dropped_saves() == {rejected.store_job_id: "circuit_breaker"}
+    now[0] = 31.0
+    store.batch_is_exist.side_effect = None
+    store.batch_is_exist.return_value = [1, 1]
+    _run_store_req(sender, _make_store_req("cached-probe", [b"a0", b"a1"]))
+    assert sender.store_service.save_breaker.is_open
+    now[0] = 42.0
+    store.batch_is_exist.return_value = [0, 0]
+    _run_store_req(sender, _make_store_req("failed-probe", [b"a0", b"a1"]))
+    now[0] = 53.0
+    skipped = _make_store_req("probe-cooldown", [b"a0", b"a1"])
+    _run_store_req(sender, skipped)
+    assert sender.take_dropped_saves() == {skipped.store_job_id: "circuit_breaker"}
+    sender.take_completed_saves()
+    now[0] = 73.0
+    probe = _make_store_req("probe", [b"a0", b"a1"])
+    with _blocked_sdk(
+        store,
+        "batch_put_from_multi_buffers",
+        [0, 0],
+        lambda: _run_store_req(sender, probe),
+    ):
+        now[0] = 84.0
+        rejected = _make_store_req("probe-arrival", [b"a0", b"a1"])
+        _run_store_req(sender, rejected)
+        assert sender.take_completed_saves() == {rejected.store_job_id: 1}
+        assert sender.store_service.save_breaker.is_open
+    assert sender.take_completed_saves() == {probe.store_job_id: 1}
+    assert not sender.store_service.save_breaker.is_open
+
+
+def test_boundary_success_does_not_mask_regular_put_failure() -> None:
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.side_effect = [[0, 0], [-900, -900]] * 3
+    sender = _make_store_sending_thread(store)
+    for i in range(3):
+        req = _make_store_req(f"mixed-{i}", [b"a0", b"a1"])
+        req.boundary_puts = [BoundaryPut(0, 1, 16), BoundaryPut(0, 2, 32)]
+        _run_store_req(sender, req)
+    assert sender.store_service.save_breaker.is_open
+    assert store.batch_put_from_multi_buffers.call_count == 6
+
+
+def test_save_queue_overflow_and_expiry_leave_active_put_held(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    sender = _make_store_sending_thread(store)
+    active = _make_store_req("active", [b"a0", b"a1"])
+    active.store_job_id = next(_TEST_SAVE_SEQ)
+    sender.add_request(active)
+    run = lambda: sender._handle_request(sender.request_queue.get())
+    with _blocked_sdk(store, "batch_put_from_multi_buffers", [-900, -900], run):
+        queued_ids = set()
+        for index in range(MooncakeStoreService.MAX_SAVE_QUEUE_SIZE):
+            request = _make_store_req(f"queued-{index}", [b"a0", b"a1"])
+            request.store_job_id = next(_TEST_SAVE_SEQ)
+            queued_ids.add(request.store_job_id)
+            sender.add_request(request)
+        overflow = _make_store_req("overflow", [b"a0", b"a1"])
+        overflow.store_job_id = next(_TEST_SAVE_SEQ)
+        sender.add_request(overflow)
+        assert sender.take_completed_saves() == {overflow.store_job_id: 1}
+        assert sender.take_dropped_saves() == {overflow.store_job_id: "queue_overflow"}
+        now[0] = MooncakeStoreService.SAVE_START_TIMEOUT_S + 1
+        assert sender.take_completed_saves() == dict.fromkeys(queued_ids, 1)
+        assert sender.take_dropped_saves() == dict.fromkeys(queued_ids, "start_timeout")
+        assert sender.request_queue.unfinished_tasks == 1
+        assert store.batch_put_from_multi_buffers.call_count == 1
+    assert sender.take_completed_saves() == {active.store_job_id: 1}
+    assert sender.request_queue.unfinished_tasks == 0
+
+
+def test_save_drop_metrics_deduplicate_totals_across_reports():
+    registry = CollectorRegistry()
+    factories = {
+        cls: partial(cls, registry=registry) for cls in (Counter, Gauge, Histogram)
+    }
+    metrics = MooncakeStorePromMetrics(
+        VllmConfig(device_config=DeviceConfig(device="cpu")),
+        factories,
+        ["model"],
+        {0: ["test"]},
+    )
+    recorded: dict[str, int] = {}
+    stats = MooncakeStoreConnectorStats()
+    stats.record_save_drop_totals({"block_budget": 2}, recorded)
+    metrics.observe(stats.to_dict())
+    stats.reset()
+    totals = {
+        "block_budget": 2,
+        "start_timeout": 1,
+        "queue_overflow": 1,
+        "circuit_breaker": 1,
+    }
+    stats.record_save_drop_totals(totals, recorded)
+    stats.record_save_drop_totals(totals, recorded)
+    assert stats.reduce() == {
+        f"save_jobs_dropped_{reason}": count
+        for reason, count in totals.items()
+        if reason != "block_budget"
+    }
+    metrics.observe(stats.to_dict())
+    name = "vllm:mooncake_store_save_jobs_dropped_total"
+    for reason, count in totals.items():
+        assert (
+            registry.get_sample_value(name, {"model": "test", "reason": reason})
+            == count
+        )
 
 
 def test_store_sending_thread_reports_job_when_the_preamble_raises():
@@ -4609,10 +4767,12 @@ def _make_bare_worker(
     worker.cache_config = MagicMock()
     worker.cache_config.num_gpu_blocks = num_gpu_blocks
     worker.store = MagicMock()
-    worker.store_service = mooncake_store_worker.MooncakeStoreService(worker.store)
     worker.store.register_buffer.return_value = 0
     worker.kv_role = kv_role
     worker.can_put = kv_role in ("kv_producer", "kv_both") or save_decode_cache
+    worker.store_service = mooncake_store_worker.MooncakeStoreService(
+        worker.store, MooncakeStoreService.SaveConfig()
+    )
     worker._capacity_only = False
     worker._selective_lease = None
     worker.block_size = block_size
@@ -6643,3 +6803,23 @@ def test_aborted_request_keeps_hbm_until_native_get_returns(monkeypatch):
     )
     assert all(block.ref_cnt == 0 for block in blocks)
     assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free_before
+
+
+def test_read_breaker_distinguishes_misses_and_rejects_stale_recovery():
+    store = MagicMock()
+    store.batch_is_exist.return_value = [1]
+    service = worker.MooncakeStoreService(store, MooncakeStoreService.SaveConfig())
+    for code in (-400, -704, -400, -704):
+        store.batch_get_into_multi_buffers.return_value = [code]
+        assert service.get(["key"], [[0x1000]], [[256]]) == [code]
+    store.batch_get_into_multi_buffers.return_value = [-900]
+    run = lambda: service.get(["old"], [[0x1000]], [[256]])
+    with _blocked_sdk(store, "batch_get_into_multi_buffers", [256], run, keys=["old"]):
+        for _ in range(3):
+            assert service.lookup_exists(["key"], store.batch_is_exist) == [1]
+            assert service.get(["key"], [[0x2000]], [[256]]) == [-900]
+        assert service.read_breaker.is_open
+    assert service.read_breaker.is_open
+    with pytest.raises(worker.CacheCircuitOpen):
+        service.lookup_exists(["key"], store.batch_is_exist)
+    assert service.take_read_failures() == 3

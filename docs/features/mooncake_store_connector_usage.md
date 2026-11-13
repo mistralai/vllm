@@ -351,12 +351,53 @@ This bounds the scheduler's wait for prefix lookup. It does not cancel a master
 RPC already running inside the worker or apply to KV loads and saves. Store
 reset waits at most 60 seconds.
 
+### Save admission and queue bounds
+
+Set `kv_load_failure_policy="recompute"` in the top-level KV transfer config to
+recompute failed remote loads locally. The default `"fail"` policy terminates
+the affected requests. Both policies release buffers after transfer completion.
+
+Optional cache transfers hold at most `max_pending_blocks_ratio` of the engine's
+GPU KV blocks (default `0.1`), rounded down to whole blocks. Queued and active
+saves count shared block IDs once. Remote loads reserve the whole matched
+prefix conservatively, across cache groups, until all workers finish receiving.
+A load exceeding the remaining budget falls back to local computation before
+allocating its remote prefix; an over-budget save is skipped before pinning.
+Setting the ratio to `0` disables both external reads and saves.
+
+Queued SAVE jobs have a fixed 5-second start deadline and a limit of 256 jobs.
+Submissions to a full queue complete immediately with reason `queue_overflow`.
+The deadline only expires unstarted work; active saves keep their GPU references
+until all workers finish. Configure the HBM budget in `kv_connector_extra_config`:
+
+```json
+{
+    "kv_connector_extra_config": {
+        "max_pending_blocks_ratio": 0.1
+    }
+}
+```
+
+The Prometheus counter `vllm:mooncake_store_save_jobs_dropped_total` counts
+logical save jobs once per engine, with `reason="block_budget"`,
+`reason="start_timeout"` or `reason="queue_overflow"`. A timeout on any worker counts that job once;
+other workers may already have started saving it. These are skipped cache
+writes, not failed inference requests, keys, or blocks. SDK operation failures
+remain in the existing operation and failed-key counters.
+
+For a Grafana panel showing dropped jobs over the last five minutes:
+
+```promql
+sum by (reason) (increase(vllm:mooncake_store_save_jobs_dropped_total[5m]))
+```
+
 ### kv_connector_extra_config
 
 - `load_async` (bool): Enable asynchronous loading for better compute-I/O overlap. Default: `true`.
 - `lookup_async` (bool): Run the external prefix-cache lookup on a background thread without waiting for its result. With a positive `lookup_prefetch_limit`, lookup starts as soon as the request is added to the scheduler, so it overlaps the time the request waits in the queue. GPU KV allocation and loading still happen through the scheduler. Default: `false`.
 - `lookup_prefetch_limit` (int): Maximum number of arrival-time lookups in flight. Beyond it, a request is looked up when the scheduler first reaches it; scheduler lookups are not capped. Set to a positive value to enable arrival-time lookup. Default: `0` (disabled).
 - `lookup_prefetch_ttl_s` (float): Maximum age of a completed async lookup result, measured from when its RPC returned. Older results are looked up again, as are lookups whose token/hash range changed. Pending lookups use the separate lookup timeout above. Default: `2.0` seconds.
+- `max_pending_blocks_ratio` (float): Fraction of GPU KV blocks reserved for pending loads and held by queued or active saves. Default: `0.1`; valid range: `[0, 1]`.
 - `lookup_timeout_s` (float): Maximum wait for a prefix lookup, including executor queue time. Default: `1.0` seconds.
 - `lookup_rpc_port` (int): Custom port for the ZMQ lookup RPC socket. Default: `0`.
 - `custom_mem_pool` (str): Optional Mooncake allocator for the GPU KV cache.
@@ -596,7 +637,3 @@ To use a custom shared seed, set the same `PYTHONHASHSEED` on every instance tha
 ```bash
 PYTHONHASHSEED=<shared-value> vllm serve ...
 ```
-
-Set `kv_load_failure_policy="recompute"` in the KV transfer configuration to
-recompute failed remote loads locally. The existing `"fail"` policy terminates
-affected requests. Transfer completion is reported after synchronous SDK return.
