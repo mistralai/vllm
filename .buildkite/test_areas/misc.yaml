@@ -367,12 +367,13 @@ steps:
     - vllm/distributed/kv_transfer/kv_connector/utils.py
     - vllm/distributed/kv_transfer/kv_connector/v1/offloading/state.py
     - vllm/distributed/kv_transfer/kv_connector/v1/mooncake_store/scheduler.py
+    - vllm/distributed/kv_transfer/kv_connector/v1/mooncake_store/data.py
     - tests/v1/kv_connector/unit/test_connector_utils.py
     - tests/v1/kv_connector/unit/test_mooncake_store_scheduler.py
   commands:
     - >-
       pytest -v -s -m cpu_test
-      -k 'zero_offload_policy or request_offload_limit'
+      -k 'zero_offload_policy or request_offload_limit or shared_prefix_junction_handoff'
       v1/kv_connector/unit/test_connector_utils.py
       v1/kv_connector/unit/test_mooncake_store_scheduler.py
 

@@ -343,8 +343,11 @@ checkpoint saves. Store lookups and loads remain enabled.
 }
 ```
 
-This request option currently supports disabling writes with `0`; positive
-token limits are not enforced by `MooncakeStoreConnector`.
+Positive integers cap writes at that token offset. For example,
+`max_offload_tokens=100` stores only complete blocks and checkpoints within the
+first 100 tokens. Partial-tail attention proofs must also fit within the cap.
+Omit the option or set it to `null` for no cap. Invalid values, including
+booleans, negatives, strings, and floats, are ignored with a warning.
 
 ### KV Role Options
 

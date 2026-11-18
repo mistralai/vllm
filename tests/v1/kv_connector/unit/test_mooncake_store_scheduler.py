@@ -78,7 +78,6 @@ def _make_bare_scheduler(
     scheduler._unfinished_request_ids = {"req-0"}
     scheduler._unfinished_requests = {}
     scheduler._request_trackers = {}
-    scheduler._save_disabled_requests = set()
     scheduler._finished_partial_tail_metas = {}
     scheduler._finished_lookahead_metas = {}
     scheduler._gpu_block_pool = BlockPool(
@@ -168,6 +167,7 @@ def _make_decode_scheduler_output(
 def _make_new_scheduler_output(*, hash_block_size: int = 16) -> SimpleNamespace:
     request = SimpleNamespace(
         req_id="req-0",
+        kv_transfer_params=None,
         num_computed_tokens=0,
         prompt_token_ids=list(range(32)),
         num_prompt_tokens=32,
@@ -662,6 +662,7 @@ def _make_resumed_unfinished_request(
     num_computed_tokens: int,
 ) -> None:
     request = SimpleNamespace(
+        kv_transfer_params=None,
         all_token_ids=token_ids,
         num_prompt_tokens=32,
         block_hashes=block_hashes,
@@ -1536,21 +1537,27 @@ def test_partial_tail_follows_lookahead_checkpoint(
     )
 
 
+@pytest.mark.cpu_test
 @pytest.mark.parametrize(
-    "completed, mamba_tails, publish, expected",
+    "completed, mamba_tails, publish, max_offload_tokens, expected",
     [
         # The chunk ending at the junction (40) hands off its Mamba state. Its
         # attention KV comes from the normal saves, so nothing is added here.
-        (40, [40], False, []),
+        (40, [40], False, None, []),
         # The prompt-completing save: blocks from the LCM floor 64 up to the
         # checkpoint 68 plus the EAGLE proof unit, whether or not the junction
         # hand-off is in the same save.
-        (75, [68], True, [BoundaryPut(0, 17, 68), BoundaryPut(0, 18, 72)]),
-        (75, [40, 68], True, [BoundaryPut(0, 17, 68), BoundaryPut(0, 18, 72)]),
+        (75, [68], True, None, [BoundaryPut(0, 17, 68), BoundaryPut(0, 18, 72)]),
+        (75, [40, 68], True, None, [BoundaryPut(0, 17, 68), BoundaryPut(0, 18, 72)]),
+        # The checkpoint fits at 68, but its attention proof ends at 72.
+        (75, [68], True, 0, []),
+        (75, [68], True, 68, []),
+        (75, [68], True, 71, []),
+        (75, [68], True, 72, [BoundaryPut(0, 17, 68), BoundaryPut(0, 18, 72)]),
     ],
 )
 def test_shared_prefix_junction_handoff_adds_no_attention_tail(
-    completed, mamba_tails, publish, expected
+    completed, mamba_tails, publish, max_offload_tokens, expected
 ):
     """`--enable-mamba-shared-prefix-checkpoint` also hands off a sub-block
     Mamba state at the shared-prefix junction, below the prompt checkpoint."""
@@ -1585,6 +1592,7 @@ def test_shared_prefix_junction_handoff_adds_no_attention_tail(
         completed_token_len=completed,
         boundary_puts=[BoundaryPut(1, 60 + i, n) for i, n in enumerate(mamba_tails)],
         publish_partial_tail=publish,
+        max_offload_tokens=max_offload_tokens,
     )
 
     assert _partial_tail_non_mamba_puts(coord, req_meta, [4, 16]) == expected
@@ -2016,11 +2024,13 @@ def store_scheduler() -> MooncakeStoreScheduler:
     return scheduler
 
 
-def _make_offload_policy_request(max_offload_tokens: int | None) -> Request:
+def _make_offload_policy_request(
+    max_offload_tokens: int | None, num_tokens: int = 30
+) -> Request:
     init_none_hash(sha256)
     return Request(
         request_id="req-0",
-        prompt_token_ids=list(range(30)),
+        prompt_token_ids=list(range(num_tokens)),
         sampling_params=SamplingParams(
             max_tokens=32,
             extra_args={
@@ -2118,3 +2128,64 @@ def test_zero_offload_policy_preserves_loads(
     assert load.load_spec is not None and load.load_spec.can_load
     assert load.load_spec.kvpool_cached_tokens == 16
     assert scheduler._pinned_saves == {}
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("max_offload_tokens", [0, 15, 16, 100, 131, 132, None])
+def test_request_offload_limit_bounds_regular_and_checkpoint_stores(
+    store_scheduler: MooncakeStoreScheduler, max_offload_tokens: int | None
+) -> None:
+    scheduler = store_scheduler
+    request = _make_offload_policy_request(max_offload_tokens, num_tokens=134)
+    block_ids = (list(range(1, 10)), [0] * 8 + [20])
+    scheduler.update_state_after_alloc(request, KVCacheBlocks(()), 0)
+    output = SchedulerOutput.make_empty()
+    output.scheduled_new_reqs = [
+        NewRequestData.from_request(request, block_ids, list(range(134)))
+    ]
+    output.num_scheduled_tokens = {request.request_id: 134}
+    output.kv_connector_block_state = _make_connector_block_state(
+        block_ids, [(1, 30, 96), (1, 31, 112), (1, 32, 132)]
+    )
+    meta = scheduler.build_connector_meta(output)
+    limit = 134 if max_offload_tokens is None else max_offload_tokens
+    expected_regular_tokens = min(limit, 134) // 16 * 16
+    assert (
+        max((item.token_len_chunk for item in meta.requests), default=0)
+        == expected_regular_tokens
+    )
+    assert {
+        put.num_tokens
+        for item in meta.requests
+        for put in item.boundary_puts or []
+        if put.group_id == 1
+    } == {boundary for boundary in (96, 112, 132) if boundary <= limit}
+    assert all(
+        put.num_tokens <= limit
+        for item in meta.requests
+        for put in item.boundary_puts or []
+    )
+
+    request.num_computed_tokens = 134
+    scheduler.register_finished_partial_tail(request, block_ids, [(1, 32, 132)])
+    assert bool(scheduler._finished_partial_tail_metas) == (limit >= 132)
+
+    request.append_output_token_ids(list(range(26)))
+    output = SchedulerOutput.make_empty()
+    output.scheduled_cached_reqs.req_ids = [request.request_id]
+    output.scheduled_cached_reqs.new_block_ids = [()]
+    output.scheduled_cached_reqs.num_computed_tokens = [134]
+    output.num_scheduled_tokens = {request.request_id: 26}
+    output.kv_connector_block_state = _make_connector_block_state(
+        block_ids, [(1, 33, 160)]
+    )
+    decode = scheduler.build_connector_meta(output)
+    if max_offload_tokens is not None:
+        assert all(item.token_len_chunk <= limit for item in decode.requests)
+        assert all(
+            put.num_tokens <= limit
+            for item in decode.requests
+            for put in item.boundary_puts or []
+        )
+    else:
+        assert any(item.token_len_chunk == 160 for item in decode.requests)
