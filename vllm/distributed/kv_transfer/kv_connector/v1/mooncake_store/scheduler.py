@@ -598,11 +598,6 @@ class MooncakeStoreScheduler:
                 continue
             self._pinned_saves[store_job_id] = (block_ids, self._num_workers)
             pool.touch([pool.blocks[block_id] for block_id in block_ids])
-        requests[:] = [
-            req_meta
-            for req_meta in requests
-            if req_meta.can_save or req_meta.load_spec is not None
-        ]
 
     def register_finished_lookahead_save(
         self,

@@ -305,10 +305,10 @@ class ReqMeta:
     boundary_puts: list[BoundaryPut] | None = None
     # Total computed prefix length at the end of this step.
     completed_token_len: int | None = None
+    max_offload_tokens: int | None = None
     # Set on the save that first covers the whole prompt, so the scheduler
     # publishes the prompt's partial tail once rather than on every save.
     publish_partial_tail: bool = False
-    max_offload_tokens: int | None = None
 
     @staticmethod
     def from_request_tracker(

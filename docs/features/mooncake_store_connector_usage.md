@@ -331,7 +331,7 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
 
 ## KV Transfer Config
 
-### Disable offloading for a request
+### Per-request offload limit
 
 Set `kv_transfer_params.max_offload_tokens` to the integer `0` to disable all
 Mooncake writes for that request, including prefill, decode, and finish-time
