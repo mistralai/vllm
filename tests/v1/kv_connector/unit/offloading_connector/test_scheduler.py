@@ -388,13 +388,17 @@ def _make_partial_tail_request(
 
 
 def _make_real_partial_tail_request(
-    scheduler: OffloadingConnectorScheduler, request_id: str
+    scheduler: OffloadingConnectorScheduler,
+    request_id: str,
+    kv_transfer_params: dict[str, Any] | None = None,
 ) -> Request:
     init_none_hash(sha256)
     request = Request(
         request_id=request_id,
         prompt_token_ids=list(range(30)),
-        sampling_params=SamplingParams(max_tokens=1),
+        sampling_params=SamplingParams(
+            max_tokens=1, extra_args={"kv_transfer_params": kv_transfer_params}
+        ),
         pooling_params=None,
         block_hasher=get_request_block_hasher(4, sha256),
     )
@@ -460,9 +464,14 @@ def _reduce_kv_connector_stats(runner):
     return reduced
 
 
-def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
+@pytest.mark.parametrize("max_offload_tokens", [None, 0, 16, 27, 28, 30])
+def test_partial_tail_store_uses_attention_and_recurrent_cow_sources(
+    max_offload_tokens: int | None,
+) -> None:
     scheduler = _make_partial_tail_scheduler()
-    request = _make_partial_tail_request(scheduler)
+    request = _make_real_partial_tail_request(
+        scheduler, "req", {"max_offload_tokens": max_offload_tokens}
+    )
     req_status = scheduler._req_status["req"]
     req_status.group_states[0].block_ids[:] = [11, 12]
     req_status.group_states[1].block_ids[:] = [0, 21]
@@ -470,14 +479,20 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
         lambda keys, req_context, trigger: generate_store_output(keys)
     )
 
-    output = SimpleNamespace(
-        kv_connector_block_state=KVConnectorBlockState(
-            req_ids=set(),
-            resolve_block_ids={}.__getitem__,
-            boundary_state_offloads={"req": [(1, 99, 28)]},
-        )
+    output = SchedulerOutput.make_empty()
+    output.kv_connector_block_state = KVConnectorBlockState(
+        req_ids=set(),
+        resolve_block_ids={}.__getitem__,
+        boundary_state_offloads={"req": [(1, 99, 28)]},
     )
     jobs = _partial_tail_store_jobs(scheduler, output)
+
+    if max_offload_tokens is not None and max_offload_tokens < 28:
+        assert jobs == {}
+        assert req_status.transfer_jobs == set()
+        assert scheduler._block_id_to_pending_jobs == {}
+        _as_mock(scheduler.manager.prepare_store).assert_not_called()
+        return
 
     assert len(jobs) == 1
     offered_keys = _as_mock(scheduler.manager.prepare_store).call_args.args[0]
@@ -1969,7 +1984,10 @@ def test_eagle_proof_margin_follows_core_hit_alignment(
     assert scheduler.config.partial_tail_key_tokens(1, 24) == 24
 
 
-def test_eagle_partial_tail_store_keys_attention_at_proof():
+@pytest.mark.parametrize("max_offload_tokens", [None, 0, 16, 23, 24, 27, 28, 30])
+def test_eagle_partial_tail_store_keys_attention_at_proof(
+    max_offload_tokens: int | None,
+) -> None:
     """The EAGLE group stores its tail block under the hash one unit later.
 
     With EAGLE block drop, core puts the Mamba checkpoint of a 30-token prompt
@@ -1977,7 +1995,9 @@ def test_eagle_partial_tail_store_keys_attention_at_proof():
     so the attention block is stored under the hash that ends at 28.
     """
     scheduler = _make_partial_tail_scheduler(eagle=True)
-    request = _make_partial_tail_request(scheduler)
+    request = _make_real_partial_tail_request(
+        scheduler, "req", {"max_offload_tokens": max_offload_tokens}
+    )
     request.num_computed_tokens = 30
     req_status = scheduler._req_status["req"]
     req_status.loaded_from_offload = True
@@ -1987,20 +2007,28 @@ def test_eagle_partial_tail_store_keys_attention_at_proof():
         generate_store_output(keys)
     )
 
-    output = SimpleNamespace(
-        num_scheduled_tokens={},
-        kv_connector_block_state=KVConnectorBlockState(
-            req_ids=set(),
-            resolve_block_ids={}.__getitem__,
-            boundary_state_offloads={"req": [(1, 99, 24)]},
-        ),
+    output = SchedulerOutput.make_empty()
+    output.kv_connector_block_state = KVConnectorBlockState(
+        req_ids=set(),
+        resolve_block_ids={}.__getitem__,
+        boundary_state_offloads={"req": [(1, 99, 24)]},
     )
     jobs = _partial_tail_store_jobs(scheduler, output)
+
+    if max_offload_tokens is not None and max_offload_tokens < 28:
+        assert jobs == {}
+        assert req_status.transfer_jobs == set()
+        assert scheduler._block_id_to_pending_jobs == {}
+        _as_mock(scheduler.manager.prepare_store).assert_not_called()
+        return
 
     [job_id] = jobs
     offered_keys = scheduler.manager.prepare_store.call_args.args[0]
     assert _key_tokens(scheduler, offered_keys) == {0: 28, 1: 24}
-    assert [get_offload_block_hash(key) for key in offered_keys] == [b"h6", b"h5"]
+    assert [get_offload_block_hash(key) for key in offered_keys] == [
+        request.block_hashes[6],
+        request.block_hashes[5],
+    ]
     src_spec = jobs[job_id].src_spec
     assert isinstance(src_spec, GPULoadStoreSpec)
     assert src_spec.block_ids.tolist() == [12, 99]
