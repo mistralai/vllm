@@ -358,6 +358,24 @@ steps:
       depends_on:
       - image-build-amd
 
+- label: ":computer: (CPU) KV Request Offload Policy"
+  key: kv-request-offload-policy-cpu
+  depends_on:
+    - image-build-cpu
+  device: cpu-small
+  source_file_dependencies:
+    - vllm/distributed/kv_transfer/kv_connector/utils.py
+    - vllm/distributed/kv_transfer/kv_connector/v1/offloading/state.py
+    - vllm/distributed/kv_transfer/kv_connector/v1/mooncake_store/scheduler.py
+    - tests/v1/kv_connector/unit/test_connector_utils.py
+    - tests/v1/kv_connector/unit/test_mooncake_store_scheduler.py
+  commands:
+    - >-
+      pytest -v -s -m cpu_test
+      -k 'zero_offload_policy or request_offload_limit'
+      v1/kv_connector/unit/test_connector_utils.py
+      v1/kv_connector/unit/test_mooncake_store_scheduler.py
+
 - label: ":computer: (CPU) V1 Others"
   key: v1-others-cpu
   depends_on:

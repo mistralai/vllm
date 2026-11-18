@@ -8,6 +8,7 @@
 from collections.abc import Sequence
 
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.utils import get_max_offload_tokens
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
@@ -288,10 +289,9 @@ class MooncakeStoreScheduler:
         num_external_tokens: int,
     ):
         """Update state after block allocation."""
-        params = request.kv_transfer_params
-        max_offload_tokens = params.get("max_offload_tokens") if params else None
+        max_offload_tokens = get_max_offload_tokens(request.kv_transfer_params)
         self._save_disabled_requests.discard(request.request_id)
-        if type(max_offload_tokens) is int and max_offload_tokens == 0:
+        if max_offload_tokens == 0:
             self._save_disabled_requests.add(request.request_id)
         # The lookup is consumed; a reschedule (e.g. after a failed load) must
         # not reuse its hit.
