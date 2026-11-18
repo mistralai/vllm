@@ -394,8 +394,9 @@ class RequestOffloadState:
             )
 
         # NOTE: This field is experimental and subject to change in the future.
-        self.max_offload_tokens = get_max_offload_tokens(params)
-        if self.max_offload_tokens is not None:
+        max_offload_tokens = get_max_offload_tokens(params)
+        if max_offload_tokens is not None:
+            self.max_offload_tokens = max_offload_tokens
             logger.debug(
                 "Request %s: max_offload_tokens set to %d",
                 self.req.request_id,
