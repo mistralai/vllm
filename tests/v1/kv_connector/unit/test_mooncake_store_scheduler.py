@@ -7,11 +7,16 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from tests.v1.kv_connector.unit.offloading_connector.test_config import (
+    _make_mamba_hybrid_kv_cache_config,
+)
 from tests.v1.kv_connector.unit.offloading_connector.utils import (
     circular_buffer_layer,
     make_kv_cache_group,
     mamba_layer,
 )
+from vllm import SamplingParams
+from vllm.config import CacheConfig, DeviceConfig, KVTransferConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.coordinator import (
     MooncakeStoreCoordinator,
 )
@@ -28,15 +33,153 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.scheduler impor
     MooncakeStoreScheduler,
     _partial_tail_non_mamba_puts,
 )
+from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.core.sched.output import KVConnectorBlockState
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    get_request_block_hasher,
+    init_none_hash,
+)
+from vllm.v1.core.sched.output import (
+    KVConnectorBlockState,
+    NewRequestData,
+    SchedulerOutput,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
 )
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus
+
+
+@pytest.fixture
+def store_scheduler() -> MooncakeStoreScheduler:
+    config = VllmConfig(
+        device_config=DeviceConfig("cpu"),
+        cache_config=CacheConfig(block_size=16, prefix_match_unit=4),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="MooncakeStoreConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={"save_decode_cache": True},
+        ),
+    )
+    cache = _make_mamba_hybrid_kv_cache_config()
+    cache.cache_hit_alignment_tokens = 4
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store."
+        "scheduler.LookupKeyClient",
+        return_value=_StubLookupClient(hit_tokens=16),
+    ):
+        scheduler = MooncakeStoreScheduler(config, cache)
+    scheduler.bind_gpu_block_pool(
+        BlockPool(num_gpu_blocks=64, enable_caching=True, hash_block_size=4)
+    )
+    return scheduler
+
+
+def _make_offload_policy_request(max_offload_tokens: int | None) -> Request:
+    init_none_hash(sha256)
+    return Request(
+        request_id="req-0",
+        prompt_token_ids=list(range(30)),
+        sampling_params=SamplingParams(
+            max_tokens=32,
+            extra_args={
+                "kv_transfer_params": {"max_offload_tokens": max_offload_tokens}
+            },
+        ),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(4, sha256),
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("max_offload_tokens", "expect_stores"), [(None, True), (0, False), (False, True)]
+)
+def test_zero_offload_policy_suppresses_prefill_decode_and_finish_stores(
+    store_scheduler: MooncakeStoreScheduler,
+    max_offload_tokens: int | None,
+    expect_stores: bool,
+) -> None:
+    scheduler = store_scheduler
+    request = _make_offload_policy_request(max_offload_tokens)
+    block_ids = ([1, 2, 6], [0, 3, 4])
+    scheduler.update_state_after_alloc(request, KVCacheBlocks(()), 0)
+    output = SchedulerOutput.make_empty()
+    output.scheduled_new_reqs = [
+        NewRequestData.from_request(request, block_ids, list(range(30)))
+    ]
+    output.num_scheduled_tokens = {request.request_id: 30}
+    output.kv_connector_block_state = _make_connector_block_state(
+        block_ids, [(1, 5, 28)]
+    )
+    prefill = scheduler.build_connector_meta(output)
+
+    request.num_computed_tokens = 30
+    request.append_output_token_ids(list(range(18)))
+    output = SchedulerOutput.make_empty()
+    output.scheduled_cached_reqs.req_ids = [request.request_id]
+    output.scheduled_cached_reqs.new_block_ids = [()]
+    output.scheduled_cached_reqs.num_computed_tokens = [30]
+    output.num_scheduled_tokens = {request.request_id: 18}
+    output.kv_connector_block_state = _make_connector_block_state(
+        block_ids, [(1, 4, 48)]
+    )
+    decode = scheduler.build_connector_meta(output)
+    request.num_computed_tokens = 48
+    scheduler.register_finished_partial_tail(request, block_ids, [(1, 5, 28)])
+
+    if not expect_stores:
+        assert prefill.requests == []
+        assert decode.requests == []
+        assert scheduler._pinned_saves == {}
+        assert scheduler._finished_partial_tail_metas == {}
+        assert not scheduler.has_pending_push_work()
+    else:
+        assert any(meta.can_save for meta in prefill.requests)
+        assert any(meta.can_save for meta in decode.requests)
+        assert scheduler._finished_partial_tail_metas
+
+    output = SchedulerOutput.make_empty()
+    output.finished_req_ids = {request.request_id}
+    scheduler.build_connector_meta(output)
+    # Reusing the request ID must not inherit the previous write policy.
+    request = _make_offload_policy_request(None)
+    scheduler.update_state_after_alloc(request, KVCacheBlocks(()), 0)
+    output = SchedulerOutput.make_empty()
+    output.scheduled_new_reqs = [
+        NewRequestData.from_request(request, block_ids, list(range(30)))
+    ]
+    output.num_scheduled_tokens = {request.request_id: 30}
+    output.kv_connector_block_state = _make_connector_block_state(block_ids)
+    assert any(
+        meta.can_save for meta in scheduler.build_connector_meta(output).requests
+    )
+
+
+@pytest.mark.cpu_test
+def test_zero_offload_policy_preserves_loads(
+    store_scheduler: MooncakeStoreScheduler,
+) -> None:
+    scheduler = store_scheduler
+    request = _make_offload_policy_request(0)
+    matched, asynchronous = scheduler.get_num_new_matched_tokens(request, 0)
+    assert (matched, asynchronous) == (16, True)
+    blocks = KVCacheBlocks(([KVCacheBlock(1)], [KVCacheBlock(2)]))
+    scheduler.update_state_after_alloc(request, blocks, 16)
+    output = SchedulerOutput.make_empty()
+    output.scheduled_new_reqs = [
+        NewRequestData.from_request(request, ([1, 3], [2, 4]), list(range(30)))
+    ]
+    output.num_scheduled_tokens = {request.request_id: 14}
+    meta = scheduler.build_connector_meta(output)
+    [load] = meta.requests
+    assert not load.can_save
+    assert load.load_spec is not None and load.load_spec.can_load
+    assert load.load_spec.kvpool_cached_tokens == 16
+    assert scheduler._pinned_saves == {}
 
 
 def _make_bare_scheduler(
@@ -64,6 +207,7 @@ def _make_bare_scheduler(
     scheduler._unfinished_request_ids = {"req-0"}
     scheduler._unfinished_requests = {}
     scheduler._request_trackers = {}
+    scheduler._save_disabled_requests = set()
     scheduler._finished_partial_tail_metas = {}
     scheduler._finished_lookahead_metas = {}
     scheduler._gpu_block_pool = BlockPool(
@@ -277,6 +421,7 @@ def test_pending_load_for_non_chosen_connector_is_dropped():
     request = SimpleNamespace(
         request_id="req-0",
         block_hashes=[b"h0", b"h1", b"h2"],
+        kv_transfer_params=None,
     )
     blocks = SimpleNamespace(get_block_ids=lambda: ([1, 2], [9]))
     scheduler.load_specs["req-0"] = LoadSpec(
@@ -374,7 +519,7 @@ def test_update_state_excludes_nontransfer_groups():
     """Store metadata must match the worker's registered cache groups."""
     scheduler = _make_bare_scheduler()
     scheduler._store_group_ids = (0,)
-    request = SimpleNamespace(request_id="req-1")
+    request = SimpleNamespace(request_id="req-1", kv_transfer_params=None)
     blocks = KVCacheBlocks(([KVCacheBlock(1), KVCacheBlock(2)], [KVCacheBlock(9)]))
 
     scheduler.update_state_after_alloc(request, blocks, num_external_tokens=32)

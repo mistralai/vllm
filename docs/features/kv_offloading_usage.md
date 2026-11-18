@@ -481,8 +481,6 @@ Implement `SecondaryTierManager` (`vllm/v1/kv_offload/tiering/base.py`) in your 
 
 Individual requests can cap how many of their tokens are eligible for offload by setting `max_offload_tokens` in the request's `kv_transfer_params`. Only the first `max_offload_tokens` tokens of the request are offloaded; blocks beyond that point are skipped on the store path. This is useful when a known prefix (e.g., a system prompt or shared context) is worth caching but later request-specific tokens are not.
 
-For hybrid models, a partial-tail checkpoint is skipped when its boundary exceeds the cap. With EAGLE, the cap must also cover the attention proof tokens beyond that checkpoint.
-
 | Key | Type | Notes |
 | --- | --- | --- |
 | `max_offload_tokens` | non-negative `int` | Upper bound on tokens to offload for this request. `0` disables offload for the request entirely; omit the key (or set to `None`) for no cap. Non-`int`, negative, or `bool` values are rejected with a warning and treated as no cap. |

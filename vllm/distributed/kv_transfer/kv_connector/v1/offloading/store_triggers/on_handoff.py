@@ -169,12 +169,13 @@ class OnHandoffStoreHandler(StoreTriggerHandler):
                     self._config.kv_group_configs, req_status.group_states
                 )
             }
-            max_boundary = req_status.num_offloadable_tokens(req.num_prompt_tokens)
+            max_boundary = min(
+                req.num_prompt_tokens,
+                req_status.max_offload_tokens or req.num_prompt_tokens,
+            )
             assert boundary > 0
             assert boundary % self._config.tokens_per_hash == 0
-            # Include attention proof tokens in the request's offload cap.
-            if boundary + max_eagle_proof_margin > max_boundary:
-                continue
+            assert boundary <= max_boundary
 
             if max_eagle_proof_margin:
                 # The CoW hand-off arrives on the step that computes the prompt

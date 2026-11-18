@@ -198,6 +198,7 @@ class MooncakeStoreScheduler:
         self.load_specs: dict[str, LoadSpec] = {}  # to be loaded
         # Save progress starts when a request is scheduled for compute.
         self._request_trackers: dict[str, RequestTracker] = {}
+        self._save_disabled_requests: set[str] = set()
         self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
         self._unfinished_request_ids: set[str] = set()
         self._finished_partial_tail_metas: dict[str, ReqMeta] = {}
@@ -287,6 +288,11 @@ class MooncakeStoreScheduler:
         num_external_tokens: int,
     ):
         """Update state after block allocation."""
+        params = request.kv_transfer_params
+        max_offload_tokens = params.get("max_offload_tokens") if params else None
+        self._save_disabled_requests.discard(request.request_id)
+        if type(max_offload_tokens) is int and max_offload_tokens == 0:
+            self._save_disabled_requests.add(request.request_id)
         # The lookup is consumed; a reschedule (e.g. after a failed load) must
         # not reuse its hit.
         self.client.discard(request.request_id)
@@ -328,6 +334,7 @@ class MooncakeStoreScheduler:
         can_process_cached = not is_consumer or self.save_decode_cache
 
         for finished_req_id in scheduler_output.finished_req_ids:
+            self._save_disabled_requests.discard(finished_req_id)
             self.load_specs.pop(finished_req_id, None)
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
@@ -339,6 +346,7 @@ class MooncakeStoreScheduler:
             if entry is not None and entry[0].status != RequestStatus.PREEMPTED:
                 continue  # Already re-admitted; the state is the new attempt's.
             self.client.discard(req_id)
+            self._save_disabled_requests.discard(req_id)
             self.load_specs.pop(req_id, None)
             self._request_trackers.pop(req_id, None)
             self._unfinished_requests.pop(req_id, None)
@@ -538,6 +546,12 @@ class MooncakeStoreScheduler:
         so a reference keeps them out of the free queue even once the request
         itself is freed, until every rank reports the job done.
         """
+        requests[:] = [
+            req_meta
+            for req_meta in requests
+            if not req_meta.can_save
+            or req_meta.req_id not in self._save_disabled_requests
+        ]
         pool = self._gpu_block_pool
         coord = self._store_coord
         assert coord is not None
@@ -635,6 +649,8 @@ class MooncakeStoreScheduler:
         partial_tail_offloads: list[tuple[int, int, int]],
     ) -> bool:
         """Queue and pin a finish-time tail for the next connector step."""
+        if request.request_id in self._save_disabled_requests:
+            return False
         if self.kv_role == "kv_consumer" or not partial_tail_offloads:
             return False
         tracker = self._request_trackers.get(request.request_id)
