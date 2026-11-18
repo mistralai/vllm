@@ -334,11 +334,11 @@ class MooncakeStoreScheduler:
         can_process_cached = not is_consumer or self.save_decode_cache
 
         for finished_req_id in scheduler_output.finished_req_ids:
-            self._save_disabled_requests.discard(finished_req_id)
             self.load_specs.pop(finished_req_id, None)
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
             self._unfinished_request_ids.discard(finished_req_id)
+            self._save_disabled_requests.discard(finished_req_id)
 
         preempted_ids = scheduler_output.preempted_req_ids or set()
         for req_id in preempted_ids:
@@ -346,10 +346,10 @@ class MooncakeStoreScheduler:
             if entry is not None and entry[0].status != RequestStatus.PREEMPTED:
                 continue  # Already re-admitted; the state is the new attempt's.
             self.client.discard(req_id)
-            self._save_disabled_requests.discard(req_id)
             self.load_specs.pop(req_id, None)
             self._request_trackers.pop(req_id, None)
             self._unfinished_requests.pop(req_id, None)
+            self._save_disabled_requests.discard(req_id)
 
         meta = MooncakeStoreConnectorMetadata(
             self._unfinished_request_ids,
