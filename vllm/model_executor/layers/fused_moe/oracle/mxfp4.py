@@ -143,6 +143,13 @@ def _swizzle_cutlass_mxfp4_scales(scale: torch.Tensor) -> torch.Tensor:
 
 
 class Mxfp4MoeBackend(Enum):
+    # No oracle-selected kernel backend. Used for:
+    # - Quark OCP-MX MoE schemes without an oracle backend, which fall back to
+    #   EMULATION (`QuarkOCP_MX_MoEMethod`);
+    # - online MXFP4 with no kernel, which only quantizes and pads the weights
+    #   (`Mxfp4OnlineMoEMethod`, `Mxfp4MoEMethod` skip kernel setup);
+    # - requantization sources (checkpoint methods that only dequantize weights
+    #   for an online method), see `MoEKernelOracle.placeholder_backend`.
     NONE = "None"
     # b12x backends
     B12X_MXFP4_MXFP8 = "B12X_MXFP4_MXFP8"
@@ -594,6 +601,7 @@ class Mxfp4MoEKernelOracle(MoEKernelOracle[Mxfp4MoeBackend]):
     """MXFP4 MoE backend selection for one deployment configuration."""
 
     name = "Mxfp4"
+    placeholder_backend = Mxfp4MoeBackend.NONE
 
     def backend_to_kernel_cls(
         self, backend: Mxfp4MoeBackend
@@ -685,8 +693,14 @@ def select_mxfp4_moe_backend(
             Use kFp8StaticTensorSym for W4A8 scheme.
 
     Note: Shape-specific fallbacks may still occur at runtime.
+    Returns `NONE` and a placeholder experts class for requantization sources.
 
     """
+    # TODO: migrate to oracle base method.
+    source = Mxfp4MoEKernelOracle.maybe_skip_for_requantization_source()
+    if source is not None:
+        return source
+
     runner_backend = config.moe_backend
     requested_activation_key = _resolve_activation_key(activation_key)
 
@@ -749,7 +763,7 @@ def select_mxfp4_moe_backend(
         )
         kernel_cls, rejected = oracle.try_backend(backend, activation_key=act_key)
         if kernel_cls is not None:
-            logger.info_once(oracle.make_log_backend(backend))
+            logger.debug_once(oracle.make_log_backend(backend))
             _warn_on_bf16_fallback(backend, requested_activation_key)
             return backend, kernel_cls
         unsupported_reasons.extend((backend, reason) for _, reason in rejected)
@@ -783,7 +797,13 @@ def select_deepseek_v4_mxfp4_moe_backend(
 ) -> tuple[Mxfp4MoeBackend, type[mk.FusedMoEExperts] | None]:
     """Select the MXFP4 MoE backend with MXFP8 activation as top priority.
     Falls back through BF16 and other backends.
+    Returns `NONE` and a placeholder experts class for requantization sources.
     """
+    # TODO: migrate to oracle base method.
+    source = Mxfp4MoEKernelOracle.maybe_skip_for_requantization_source()
+    if source is not None:
+        return source
+
     activation_format = config.activation_format
 
     # Honor explicit moe_backend (e.g. "marlin", "triton_unfused") before
@@ -836,7 +856,7 @@ def select_deepseek_v4_mxfp4_moe_backend(
             backend, activation_key=_backend_activation_key(backend)
         )
         if kernel_cls is not None:
-            logger.info_once(oracle.make_log_backend(backend))
+            logger.debug_once(oracle.make_log_backend(backend))
             return backend, kernel_cls
 
     raise NotImplementedError(
@@ -2049,7 +2069,8 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             mxfp4_moe_ep_weights,
         )
 
-        # DeepGEMM consumes MXFP4 directly; CuTeDSL gets bf16 and requantizes.
+        # DeepGEMM and the SM107 CuTeDSL kernel consume MXFP4 as stored;
+        # CuTeDSL on SM100/SM103 gets bf16 and requantizes.
         weights = mxfp4_moe_ep_weights(
             FLASHINFER_MOE_EP_CUTEDSL
             if mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_MOE_EP_CUTEDSL
