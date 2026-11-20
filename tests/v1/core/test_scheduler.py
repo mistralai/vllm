@@ -1257,6 +1257,82 @@ def test_schedule_prefills_gating(has_running: bool):
     assert any(r.req_id == "new0" for r in output.scheduled_new_reqs)
 
 
+def _run_step(scheduler, output: SchedulerOutput) -> None:
+    """Feed back one sampled token for every request scheduled in `output`."""
+    req_ids = list(output.num_scheduled_tokens)
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            sampled_token_ids=[[0] for _ in req_ids],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+
+def _start_decoding(scheduler, req_id: str) -> None:
+    """Admit one request and run its prefill, leaving it decoding."""
+    (req,) = create_requests(num_requests=1, num_tokens=8, req_ids=[req_id])
+    scheduler.add_request(req)
+    _run_step(scheduler, scheduler.schedule())
+
+
+def test_pure_prefill_steps():
+    """With `pure_prefill_steps`, a step that admits prefill runs only the
+    prefill; decodes run in the throttled steps and once no prefill is pending.
+    """
+    scheduler = create_scheduler(max_num_seqs=16, max_num_batched_tokens=8192)
+    scheduler.scheduler_config.pure_prefill_steps = True
+    _start_decoding(scheduler, "run0")
+
+    (new_req,) = create_requests(num_requests=1, num_tokens=8, req_ids=["new0"])
+    scheduler.add_request(new_req)
+    # Throttled (decode-only) step: the prompt waits, the decode runs.
+    output = scheduler.schedule(throttle_prefills=True)
+    assert set(output.num_scheduled_tokens) == {"run0"}
+    _run_step(scheduler, output)
+    # Prefill step: only the prompt runs.
+    output = scheduler.schedule()
+    assert set(output.num_scheduled_tokens) == {"new0"}
+    _run_step(scheduler, output)
+    # No prefill pending anymore: both decode together.
+    output = scheduler.schedule()
+    assert set(output.num_scheduled_tokens) == {"run0", "new0"}
+
+
+def test_pure_prefill_steps_keep_throttled_steps_decode_only():
+    """Unlike plain prefill throttling, a saturated engine does not turn the
+    throttled steps back into mixed steps."""
+    scheduler = create_scheduler(max_num_seqs=16, max_num_batched_tokens=8192)
+    scheduler.scheduler_config.pure_prefill_steps = True
+    _start_decoding(scheduler, "run0")
+    scheduler.prefill_capacity_bound = True
+
+    (new_req,) = create_requests(num_requests=1, num_tokens=8, req_ids=["new0"])
+    scheduler.add_request(new_req)
+    output = scheduler.schedule(throttle_prefills=True)
+    assert set(output.num_scheduled_tokens) == {"run0"}
+
+
+def test_pure_prefill_steps_fall_back_when_stalled():
+    """A pure prefill step that cannot admit anything must not starve decodes."""
+    scheduler = create_scheduler(
+        max_num_seqs=16, max_num_batched_tokens=8192, num_blocks=4, block_size=16
+    )
+    scheduler.scheduler_config.pure_prefill_steps = True
+    _start_decoding(scheduler, "run0")
+
+    # Fits the KV cache, but not next to the running request.
+    (big,) = create_requests(num_requests=1, num_tokens=40, req_ids=["big"])
+    scheduler.add_request(big)
+    output = scheduler.schedule()
+    assert output.total_num_scheduled_tokens == 0
+    output = scheduler.schedule()
+    assert "run0" in output.num_scheduled_tokens
+
+
 def _setup_cache_aware(num_tokens: int = 48, **kwargs):
     """A scheduler where `warm`'s prompt is already cached and `cold`'s is not.
 

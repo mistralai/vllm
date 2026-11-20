@@ -75,6 +75,8 @@ class SchedulerInterface(ABC):
                 `prefill_schedule_interval` multiples), new prefill compute is
                 deferred to a later step; automatically overridden when the
                 engine is saturated.
+                With `pure_prefill_steps`, the other steps (False) run only
+                prefills while prefill work is pending.
 
         Returns:
             A SchedulerOutput object containing information about the scheduled

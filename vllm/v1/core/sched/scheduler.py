@@ -409,6 +409,9 @@ class Scheduler(SchedulerInterface):
         # prefill batch fully drained the waiting queue. Prefill throttling
         # is disabled in this case.
         self.prefill_capacity_bound = False
+        # Pure prefill steps: set when such a step could schedule nothing (e.g.
+        # no KV room for the waiting prefill), so the next step lets decodes run.
+        self._pure_prefill_stalled = False
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -763,10 +766,22 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.new_step_starts()
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
-        # all prefill compute unless saturated.
+        # all prefill compute unless saturated. Pure prefill steps keep the
+        # throttled steps decode-only even when saturated: mixing them back in
+        # is what that mode avoids.
+        pure_prefill_steps = self.scheduler_config.pure_prefill_steps
         defer_prefills = (
-            throttle_prefills and not self.prefill_capacity_bound
-        ) and any(not r.is_prefill_chunk for r in self.running)
+            throttle_prefills
+            and (pure_prefill_steps or not self.prefill_capacity_bound)
+            and any(not r.is_prefill_chunk for r in self.running)
+        )
+        # Pure prefill steps: a step that admits prefill runs only prefills.
+        skip_decodes = (
+            pure_prefill_steps
+            and not throttle_prefills
+            and not self._pure_prefill_stalled
+            and self._has_pending_prefill()
+        )
 
         # `long_prefill_token_threshold` exists to stop a long prefill from
         # starving other requests of the token budget. When it is the only
@@ -811,6 +826,10 @@ class Scheduler(SchedulerInterface):
             if self.current_step < request.next_decode_eligible_step:
                 # PP+async: enforce `pp_size` steps between same-req decodes
                 # to match worker-side sampled-tokens broadcast slot ring cadence.
+                req_index += 1
+                continue
+
+            if skip_decodes and not request.is_prefill_chunk:
                 req_index += 1
                 continue
 
@@ -1682,6 +1701,7 @@ class Scheduler(SchedulerInterface):
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        self._pure_prefill_stalled = skip_decodes and total_num_scheduled_tokens == 0
 
         assert token_budget >= 0
         assert input_budget >= 0
@@ -3062,6 +3082,14 @@ class Scheduler(SchedulerInterface):
             spec_token_ids.extend([-1] * (orig_num_spec_tokens - len(spec_token_ids)))
 
             sched_spec_tokens[req_id] = spec_token_ids
+
+    def _has_pending_prefill(self) -> bool:
+        """Whether a prefill chunk is running or a waiting prompt could be admitted."""
+        if any(r.is_prefill_chunk for r in self.running):
+            return True
+        return bool(self.waiting or self.kv_holding_waiting) and (
+            len(self.running) < self.max_num_running_reqs
+        )
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""

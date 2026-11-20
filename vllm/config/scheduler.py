@@ -244,6 +244,22 @@ class SchedulerConfig:
     already-admitted prompt, so a long prompt can take up to N times as many
     steps to finish prefilling."""
 
+    pure_prefill_steps: bool = False
+    """Make the steps that admit prefill (every `prefill_schedule_interval`-th
+    step) prefill-only: running decodes skip that step instead of sharing it.
+
+    With the default interval of 1 this is prefill-first scheduling (as in vLLM
+    V0): any pending prefill work gets a prefill-only step, otherwise the step
+    decodes. With an interval of N, N-1 decode-only steps alternate with one
+    prefill-only step, aligned across DP ranks. The decode-only steps stay
+    decode-only when prefill demand exceeds the cadence, so keep N small (2)
+    for prefill-heavy traffic.
+
+    Pays off when a mixed step costs more than a decode-only step plus a
+    prefill-only step, e.g. when mixed steps lose full CUDA graphs and attention
+    launches dominate (MLA, and DP where any rank's prefill affects all ranks).
+    """
+
     cache_aware_admission_window: int = Field(default=0, ge=0)
     """Look-ahead window for cache-aware admission. Within the first N waiting
     requests, those whose prefix is already in the KV cache are admitted ahead
@@ -358,6 +374,7 @@ class SchedulerConfig:
             "scheduler_reserve_full_isl",
             "watermark",
             "prefill_schedule_interval",
+            "pure_prefill_steps",
             "async_scheduling",
             "stream_interval",
         }
