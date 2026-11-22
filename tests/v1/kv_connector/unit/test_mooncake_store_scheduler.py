@@ -77,6 +77,7 @@ def _make_bare_scheduler(
     scheduler.save_decode_cache = save_decode_cache
     scheduler.enable_kv_events = False
     scheduler.lookup_async = False
+    scheduler.load_async = True
     scheduler.client = _StubLookupClient(hit_tokens=0)
     scheduler.enable_lookup = True
     scheduler._capacity_only = False
@@ -98,6 +99,7 @@ def _make_bare_scheduler(
     scheduler._num_workers = 1
     scheduler._next_store_job_id = 0
     scheduler._pinned_saves = {}
+    scheduler._pending_loads = set()
     scheduler._boundary_state_group_ids = frozenset({1})
     scheduler._store_coord = MooncakeStoreCoordinator(
         [
@@ -266,8 +268,8 @@ def _preempt(scheduler: MooncakeStoreScheduler):
     return scheduler.build_connector_meta(_make_preemption_scheduler_output())
 
 
-def _make_worker_output(completed_saves: dict[int, int]) -> SimpleNamespace:
-    return SimpleNamespace(
+def _make_worker_output(completed_saves: dict[int, int]) -> KVConnectorOutput:
+    return KVConnectorOutput(
         kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
             completed_saves=completed_saves
         )
@@ -1019,6 +1021,10 @@ class _StubLookupClient:
         self.num_tokens: list[int] = []
         self.prefetched: list[tuple[str, int]] = []
         self.discarded: list[str] = []
+        self.read_outcomes: list[tuple[int, int]] = []
+
+    def record_read_outcomes(self, failures: int, successes: int) -> None:
+        self.read_outcomes.append((failures, successes))
 
     def discard(self, req_id):
         self.discarded.append(req_id)
@@ -1103,7 +1109,6 @@ def test_full_external_hit_keeps_kvpool_cached_tokens_block_aligned():
     # The worker re-derives a full external hit below the request end on an
     # existing boundary, so the scheduler receives the usable aligned hit.
     scheduler = _make_bare_scheduler()
-    scheduler.load_async = True
     scheduler.client = _StubLookupClient(hit_tokens=32)
 
     request = SimpleNamespace(
@@ -1133,7 +1138,6 @@ def test_full_external_hit_with_full_local_hit_skips_load():
     # have scheduled a 15-token load that the recv thread couldn't translate
     # into any block-aligned key.
     scheduler = _make_bare_scheduler()
-    scheduler.load_async = True
     scheduler.client = _StubLookupClient(hit_tokens=32)
 
     request = SimpleNamespace(
@@ -1155,7 +1159,6 @@ def test_partial_hash_hit_block_aligned_local_loads_partial_tail():
     # Fine-grained on (hash=4, block=16): a block-aligned local hit can pull a
     # sub-block remote hit (24 = a hash boundary inside block 1). Loads [16, 24).
     scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
-    scheduler.load_async = True
     scheduler.client = _StubLookupClient(hit_tokens=24)
 
     request = SimpleNamespace(
@@ -1180,7 +1183,6 @@ def test_partial_hash_hit_no_remote_gain_skips_load():
     # tail before calling the connector). When the remote hit does not exceed
     # that block-aligned local hit, nothing is loaded.
     scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
-    scheduler.load_async = True
     scheduler.client = _StubLookupClient(hit_tokens=16)
 
     request = SimpleNamespace(
@@ -1204,7 +1206,6 @@ def test_sub_block_prompt_looks_up_with_fine_grained():
     # not a full block), so a remote partial hit is loaded. Pre-change the
     # block-size floor returned (0, False) for such prompts.
     scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
-    scheduler.load_async = True
     scheduler.client = _StubLookupClient(hit_tokens=8)
 
     request = SimpleNamespace(
@@ -2288,3 +2289,25 @@ def test_failed_save_releases_hbm_only_after_every_worker_finishes():
         assert store.batch_put_from_multi_buffers.call_count == 1
         assert sender._saved_offset.get(request.req_id, 0) == 0
     assert not scheduler.has_pending_push_work()
+
+
+def test_read_recovery_uses_successful_aggregated_load_completion():
+    scheduler = _make_bare_scheduler()
+    scheduler._pending_loads = {"failed", "healthy"}
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=MooncakeStoreWorkerMetadata(read_failures=1),
+        )
+    )
+    assert scheduler.client.read_outcomes == [(1, 0)]
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            finished_recving={"failed"},
+            failed_recving={"failed"},
+        )
+    )
+    assert scheduler.client.read_outcomes == [(1, 0)]
+    assert scheduler._pending_loads == {"healthy"}
+    scheduler.update_connector_output(KVConnectorOutput(finished_recving={"healthy"}))
+    assert scheduler.client.read_outcomes == [(1, 0), (0, 1)]
+    assert not scheduler._pending_loads

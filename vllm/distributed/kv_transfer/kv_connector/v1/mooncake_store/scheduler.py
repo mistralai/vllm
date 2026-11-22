@@ -196,6 +196,7 @@ class MooncakeStoreScheduler:
         self._next_store_job_id = 0
         # store_job_id -> (referenced block ids, ranks yet to report completion)
         self._pinned_saves: dict[int, tuple[list[int], int]] = {}
+        self._pending_loads: set[str] = set()
 
         # Per-request state
         self.load_specs: dict[str, LoadSpec] = {}  # to be loaded
@@ -244,6 +245,7 @@ class MooncakeStoreScheduler:
         if not self.enable_lookup:
             return 0, False
 
+        self._pending_loads.discard(request.request_id)
         if request.num_tokens < self._lookup_align():
             return 0, False
 
@@ -273,6 +275,8 @@ class MooncakeStoreScheduler:
 
         if need_to_allocate <= 0:
             return 0, False
+
+        self._pending_loads.add(request.request_id)
 
         self.load_specs[request.request_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
@@ -306,6 +310,7 @@ class MooncakeStoreScheduler:
             return
 
         if num_external_tokens == 0:
+            self._pending_loads.discard(request.request_id)
             self.load_specs[request.request_id].can_load = False
             return
 
@@ -331,6 +336,8 @@ class MooncakeStoreScheduler:
         can_process_cached = not is_consumer or self.save_decode_cache
 
         for finished_req_id in scheduler_output.finished_req_ids:
+            if finished_req_id in self.load_specs:
+                self._pending_loads.discard(finished_req_id)
             self.load_specs.pop(finished_req_id, None)
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
@@ -342,6 +349,8 @@ class MooncakeStoreScheduler:
             if entry is not None and entry[0].status != RequestStatus.PREEMPTED:
                 continue  # Already re-admitted; the state is the new attempt's.
             self.client.discard(req_id)
+            if req_id in self.load_specs:
+                self._pending_loads.discard(req_id)
             self.load_specs.pop(req_id, None)
             self._request_trackers.pop(req_id, None)
             self._unfinished_requests.pop(req_id, None)
@@ -782,7 +791,17 @@ class MooncakeStoreScheduler:
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         """Drop the block references of store jobs every rank has finished."""
+        completed_loads = (
+            set(connector_output.finished_recving or ()) & self._pending_loads
+        )
+        successful_loads = completed_loads - connector_output.failed_recving
+        self._pending_loads.difference_update(completed_loads)
         meta = connector_output.kv_connector_worker_meta
+        read_failures = (
+            meta.read_failures if isinstance(meta, MooncakeStoreWorkerMetadata) else 0
+        )
+        if read_failures or successful_loads:
+            self.client.record_read_outcomes(read_failures, len(successful_loads))
         if not isinstance(meta, MooncakeStoreWorkerMetadata):
             return
         pool = self._gpu_block_pool
