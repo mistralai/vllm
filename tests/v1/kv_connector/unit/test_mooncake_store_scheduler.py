@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -42,6 +43,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.scheduler impor
     MooncakeStoreScheduler,
     _partial_tail_non_mamba_puts,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.store_service import (
+    MooncakeStoreService,
+)
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
@@ -71,6 +75,7 @@ def _make_bare_scheduler(
     enable_partial_hash_hits: bool = False,
     kv_role: str = "kv_both",
     save_decode_cache: bool = False,
+    max_pending_blocks: int = 64,
 ) -> MooncakeStoreScheduler:
     scheduler = object.__new__(MooncakeStoreScheduler)
     scheduler.kv_role = kv_role
@@ -99,7 +104,11 @@ def _make_bare_scheduler(
     scheduler._num_workers = 1
     scheduler._next_store_job_id = 0
     scheduler._pinned_saves = {}
+    scheduler._save_budget = MooncakeStoreService.SaveBlockBudget(max_pending_blocks)
     scheduler._pending_load_blocks = {}
+    scheduler._save_drops = {}
+    scheduler._dropped_save_ids = set()
+    scheduler._save_drop_metrics_pending = False
     scheduler._boundary_state_group_ids = frozenset({1})
     scheduler._store_coord = MooncakeStoreCoordinator(
         [
@@ -2006,10 +2015,78 @@ def test_store_job_blocks_are_released_once_every_rank_reports():
 def test_worker_metadata_aggregates_completions_across_ranks():
     # The engine merges each rank's metadata before the scheduler sees it, so a
     # job that every rank finished in one step arrives as a single count.
-    merged = MooncakeStoreWorkerMetadata(completed_saves={1: 1}).aggregate(
-        MooncakeStoreWorkerMetadata(completed_saves={1: 1, 2: 1})
+    merged = MooncakeStoreWorkerMetadata(
+        completed_saves={1: 1}, dropped_saves={1: "start_timeout"}
+    ).aggregate(
+        MooncakeStoreWorkerMetadata(
+            completed_saves={1: 1, 2: 1}, dropped_saves={1: "circuit_breaker"}
+        )
     )
     assert merged.completed_saves == {1: 2, 2: 1}
+    assert merged.dropped_saves == {1: "start_timeout"}
+
+
+def test_save_admission_rejects_before_pinning_gpu_blocks():
+    scheduler, pool, blocks, meta = _scheduled_save_case(1 / 64)
+    assert meta.requests[0].can_save is False
+    assert [b.ref_cnt for b in blocks] == [1, 1]
+    assert meta.save_drop_totals == {"block_budget": 1}
+    assert scheduler.has_pending_push_work() is False
+
+
+def test_dropped_save_is_counted_once_and_held_until_all_ranks_finish():
+    reason = "start_timeout"
+    scheduler, pool, blocks, meta = _scheduled_save_case(2 / 64)
+    job = meta.requests[0].store_job_id
+    assert job is not None
+    pool.free_blocks(blocks)
+    other_reason = "block_budget"
+    for expected_refs in (1, 0):
+        scheduler.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                    completed_saves={job: 1},
+                    dropped_saves={job: reason if expected_refs else other_reason},
+                )
+            )
+        )
+        assert [b.ref_cnt for b in blocks] == [expected_refs, expected_refs]
+    assert scheduler.has_pending_push_work()
+    output = SchedulerOutput.make_empty()
+    output.finished_req_ids = {"admission"}
+    totals = scheduler.build_connector_meta(output).save_drop_totals
+    assert totals == {reason: 1}
+    assert not scheduler.has_pending_push_work()
+
+
+def test_save_budget_counts_shared_blocks_until_the_last_release():
+    budget = MooncakeStoreService.SaveBlockBudget(1)
+    assert budget.acquire([7])
+    assert budget.acquire([7])
+    assert not budget.acquire([8])
+    budget.release([7])
+    assert not budget.acquire([8])
+    budget.release([7])
+    assert budget.acquire([8])
+
+
+def test_load_and_save_share_hbm_budget_until_receive_completes():
+    scheduler = _make_bare_scheduler(max_pending_blocks=2)
+    scheduler.client = _StubLookupClient(hit_tokens=32)
+    first = SimpleNamespace(
+        request_id="first", num_tokens=48, block_hashes=[b"h0", b"h1", b"h2"]
+    )
+    second = SimpleNamespace(
+        request_id="second", num_tokens=48, block_hashes=first.block_hashes
+    )
+    assert scheduler.get_num_new_matched_tokens(first, 0) == (32, True)
+    assert scheduler.get_num_new_matched_tokens(second, 0) == (0, False)
+    request = ReqMeta("save", 16, ([1],), block_hashes=[b"h0"], can_save=True)
+    assert not scheduler._pin_save_blocks(request, [1])
+    scheduler.update_connector_output(KVConnectorOutput(finished_recving={"first"}))
+    assert scheduler.get_num_new_matched_tokens(second, 0) == (32, True)
+    scheduler.update_connector_output(KVConnectorOutput(finished_recving={"second"}))
+    assert scheduler._pin_save_blocks(request, [1])
 
 
 @pytest.fixture
@@ -2020,10 +2097,13 @@ def store_scheduler() -> MooncakeStoreScheduler:
         kv_transfer_config=KVTransferConfig(
             kv_connector="MooncakeStoreConnector",
             kv_role="kv_both",
-            kv_connector_extra_config={"save_decode_cache": True},
+            kv_connector_extra_config={
+                "save_decode_cache": True,
+                "max_pending_blocks_ratio": 1.0,
+            },
         ),
     )
-    cache = _make_mamba_hybrid_kv_cache_config()
+    cache = replace(_make_mamba_hybrid_kv_cache_config(), num_blocks=64)
     cache.cache_hit_alignment_tokens = 4
     with patch(
         "vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store."
@@ -2204,7 +2284,9 @@ def test_request_offload_limit_bounds_regular_and_checkpoint_stores(
         assert any(item.token_len_chunk == 160 for item in decode.requests)
 
 
-def _scheduled_save_case() -> tuple[
+def _scheduled_save_case(
+    ratio: float = 1.0,
+) -> tuple[
     MooncakeStoreScheduler,
     BlockPool,
     list[KVCacheBlock],
@@ -2219,6 +2301,7 @@ def _scheduled_save_case() -> tuple[
         kv_transfer_config=KVTransferConfig(
             kv_connector="MooncakeStoreConnector",
             kv_role="kv_both",
+            kv_connector_extra_config={"max_pending_blocks_ratio": ratio},
         ),
     )
     kv_config = KVCacheConfig(

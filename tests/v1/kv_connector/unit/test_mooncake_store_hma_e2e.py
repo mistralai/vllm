@@ -257,7 +257,7 @@ def test_e2e_swa_plus_full_save_then_lookup_hits():
     # and the dict-backed store, so _handle_request runs synchronously.
     ready = threading.Event()
     send_thread = KVCacheStoreSendingThread(
-        store_service=MooncakeStoreService(store),
+        store_service=MooncakeStoreService(store, MooncakeStoreService.SaveConfig()),
         token_databases=worker.token_dbs,
         block_size=worker.block_size,
         coord=worker.coord,
@@ -597,7 +597,9 @@ def test_recv_skips_swa_blocks_before_window():
         groups, scheduler_block_size=16, hash_block_size=16
     )
     recv = KVCacheStoreRecvingThread(
-        store_service=MooncakeStoreService(_CapturingStore()),
+        store_service=MooncakeStoreService(
+            _CapturingStore(), MooncakeStoreService.SaveConfig()
+        ),
         token_databases=[db_full, db_swa],
         block_size=16,
         tp_rank=0,
@@ -726,7 +728,7 @@ def test_sub_block_partial_tail_offload_reads_cow_block():
         token_dbs.append(db)
 
     send = KVCacheStoreSendingThread(
-        store_service=MooncakeStoreService(store),
+        store_service=MooncakeStoreService(store, MooncakeStoreService.SaveConfig()),
         coord=coord,
         token_databases=token_dbs,
         block_size=16,
@@ -807,7 +809,7 @@ def test_offload_syncs_event_before_put():
         token_dbs.append(db)
 
     send = KVCacheStoreSendingThread(
-        store_service=MooncakeStoreService(store),
+        store_service=MooncakeStoreService(store, MooncakeStoreService.SaveConfig()),
         coord=coord,
         token_databases=token_dbs,
         block_size=16,
@@ -890,7 +892,7 @@ def test_sub_block_partial_tail_offload_covers_smaller_group_blocks():
         token_dbs.append(db)
 
     send = KVCacheStoreSendingThread(
-        store_service=MooncakeStoreService(store),
+        store_service=MooncakeStoreService(store, MooncakeStoreService.SaveConfig()),
         coord=coord,
         token_databases=token_dbs,
         block_size=16,
@@ -986,7 +988,7 @@ def test_worker_lookup_hits_sub_block_partial_tail(num_lookahead):
         db.set_block_len([512])
 
     send_thread = KVCacheStoreSendingThread(
-        store_service=MooncakeStoreService(store),
+        store_service=MooncakeStoreService(store, MooncakeStoreService.SaveConfig()),
         token_databases=worker.token_dbs,
         block_size=worker.block_size,
         coord=worker.coord,
@@ -1095,7 +1097,7 @@ def test_worker_setup_tolerates_finer_scratch_group():
         db.set_block_len([512])
 
     send_thread = KVCacheStoreSendingThread(
-        store_service=MooncakeStoreService(store),
+        store_service=MooncakeStoreService(store, MooncakeStoreService.SaveConfig()),
         token_databases=worker.token_dbs,
         block_size=worker.block_size,
         coord=worker.coord,
@@ -1199,7 +1201,7 @@ def test_ring_scratch_group_is_never_stored_and_does_not_block_hits():
         worker.register_kv_caches(kv_caches)
 
     send_thread = KVCacheStoreSendingThread(
-        store_service=MooncakeStoreService(store),
+        store_service=MooncakeStoreService(store, MooncakeStoreService.SaveConfig()),
         token_databases=worker.token_dbs,
         block_size=worker.block_size,
         coord=worker.coord,
@@ -1429,7 +1431,9 @@ def test_selective_lease_covers_every_key_the_load_reads(monkeypatch):
             return [0] * len(keys)
 
     recv = KVCacheStoreRecvingThread(
-        store_service=MooncakeStoreService(_CapturingStore()),
+        store_service=MooncakeStoreService(
+            _CapturingStore(), MooncakeStoreService.SaveConfig()
+        ),
         token_databases=worker.token_dbs,
         block_size=worker.block_size,
         tp_rank=0,
@@ -1466,7 +1470,7 @@ def test_selective_lease_with_partial_hash_hits(monkeypatch):
     assert worker.coord.enable_partial_hash_hits
 
     send_thread = KVCacheStoreSendingThread(
-        store_service=MooncakeStoreService(store),
+        store_service=MooncakeStoreService(store, MooncakeStoreService.SaveConfig()),
         token_databases=worker.token_dbs,
         block_size=worker.block_size,
         coord=worker.coord,

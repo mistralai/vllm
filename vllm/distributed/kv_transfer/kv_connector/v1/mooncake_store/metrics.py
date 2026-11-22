@@ -57,6 +57,11 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
         for operation, records in sorted(self.data.items()):
             if not records:
                 continue
+            if operation == "save_drops":
+                for record in records:
+                    key = f"save_jobs_dropped_{record['reason']}"
+                    reduced[key] = int(reduced.get(key, 0)) + int(record["count"])
+                continue
             durations = [float(record["duration_seconds"]) for record in records]
             reduced[f"{operation}_count"] = len(records)
             reduced[f"{operation}_avg_ms"] = round(fmean(durations) * 1e3, 3)
@@ -97,6 +102,17 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
             }
         )
 
+    def record_save_drop_totals(
+        self, totals: dict[str, int], recorded: dict[str, int]
+    ) -> None:
+        for reason, total in totals.items():
+            previous = recorded.get(reason, 0)
+            if total > previous:
+                self.data.setdefault("save_drops", []).append(
+                    {"reason": reason, "count": total - previous}
+                )
+                recorded[reason] = total
+
 
 class MooncakeStorePromMetrics(KVConnectorPromMetrics):
     """Prometheus metrics for Mooncake store communication."""
@@ -111,6 +127,20 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
         super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
         metric_labelnames = labelnames + ["operation", "status"]
         self._metric_cache: dict[tuple[int, str, str], dict[str, PromMetric]] = {}
+        self._counter_save_drops = self._counter_cls(
+            name="vllm:mooncake_store_save_jobs_dropped_total",
+            documentation="Number of optional cache save jobs dropped per engine.",
+            labelnames=labelnames + ["reason"],
+        )
+
+        for values in per_engine_labelvalues.values():
+            for reason in (
+                "block_budget",
+                "start_timeout",
+                "queue_overflow",
+                "circuit_breaker",
+            ):
+                self._counter_save_drops.labels(*values, reason)
 
         self._histogram_operation_time = self._histogram_cls(
             name="vllm:mooncake_store_operation_time_seconds",
@@ -180,6 +210,12 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
             assert isinstance(records, list)
             for record in records:
                 assert isinstance(record, dict)
+                if operation == "save_drops":
+                    values = self.per_engine_labelvalues[engine_idx] + [
+                        record["reason"]
+                    ]
+                    self._counter_save_drops.labels(*values).inc(int(record["count"]))
+                    continue
                 status = str(record["status"])
                 metrics = self._get_metrics(engine_idx, operation, status)
                 metrics["time"].observe(float(record["duration_seconds"]))
