@@ -99,7 +99,7 @@ def _make_bare_scheduler(
     scheduler._num_workers = 1
     scheduler._next_store_job_id = 0
     scheduler._pinned_saves = {}
-    scheduler._pending_load_blocks = {}
+    scheduler._pending_loads = set()
     scheduler._boundary_state_group_ids = frozenset({1})
     scheduler._store_coord = MooncakeStoreCoordinator(
         [
@@ -2293,7 +2293,7 @@ def test_failed_save_releases_hbm_only_after_every_worker_finishes():
 
 def test_read_recovery_uses_successful_aggregated_load_completion():
     scheduler = _make_bare_scheduler()
-    scheduler._pending_load_blocks = {"failed": 2, "healthy": 2}
+    scheduler._pending_loads = {"failed", "healthy"}
     scheduler.update_connector_output(
         KVConnectorOutput(
             kv_connector_worker_meta=MooncakeStoreWorkerMetadata(read_failures=1),
@@ -2307,7 +2307,7 @@ def test_read_recovery_uses_successful_aggregated_load_completion():
         )
     )
     assert scheduler.client.read_outcomes == [(1, 0)]
-    assert scheduler._pending_load_blocks == {"healthy": 2}
+    assert scheduler._pending_loads == {"healthy"}
     scheduler.update_connector_output(KVConnectorOutput(finished_recving={"healthy"}))
     assert scheduler.client.read_outcomes == [(1, 0), (0, 1)]
-    assert not scheduler._pending_load_blocks
+    assert not scheduler._pending_loads
