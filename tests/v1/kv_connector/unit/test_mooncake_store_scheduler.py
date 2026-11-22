@@ -2071,7 +2071,7 @@ def test_save_budget_counts_shared_blocks_until_the_last_release():
 
 
 def test_load_and_save_share_hbm_budget_until_receive_completes():
-    scheduler = _make_bare_scheduler(max_pending_blocks=2)
+    scheduler = _make_bare_scheduler(max_pending_blocks=4)
     scheduler.client = _StubLookupClient(hit_tokens=32)
     first = SimpleNamespace(
         request_id="first", num_tokens=48, block_hashes=[b"h0", b"h1", b"h2"]

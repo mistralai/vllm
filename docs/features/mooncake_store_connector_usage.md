@@ -402,7 +402,9 @@ the affected requests. Both policies release buffers after transfer completion.
 Optional cache transfers hold at most `max_pending_blocks_ratio` of the engine's
 GPU KV blocks (default `0.1`), rounded down to whole blocks. Queued and active
 saves count shared block IDs once. Remote loads reserve the whole matched
-prefix conservatively, across cache groups, until all workers finish receiving.
+prefix conservatively until all workers finish receiving. Each transferred
+cache group is counted using its own DCP-resolved block size, rather than the
+common token-alignment size. Groups outside the store projection do not count.
 A load exceeding the remaining budget falls back to local computation before
 allocating its remote prefix; an over-budget save is skipped before pinning.
 Setting the ratio to `0` disables both external reads and saves.

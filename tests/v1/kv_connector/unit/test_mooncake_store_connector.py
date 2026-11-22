@@ -16,7 +16,11 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
 )
 from tests.v1.kv_connector.unit.test_multi_connector import _lookahead_connector_config
 from vllm import SamplingParams
-from vllm.config import KVEventsConfig, set_current_vllm_config
+from vllm.config import (
+    KVEventsConfig,
+    ParallelConfig,
+    set_current_vllm_config,
+)
 from vllm.distributed.kv_events import BlockStored
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -46,7 +50,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.metrics import 
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.kv_cache_utils import (
+    get_request_block_hasher,
+    init_none_hash,
+    resolve_kv_cache_block_sizes,
+)
 from vllm.v1.core.sched.output import (
     KVConnectorBlockState,
     NewRequestData,
@@ -826,6 +834,92 @@ def _gated_recv(gate: threading.Event, value: int):
         return value.to_bytes(4, "big")
 
     return recv
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "use_mamba,dcp,include_circular,required_blocks",
+    [
+        (False, 1, False, 10),
+        (False, 2, False, 5),
+        (True, 2, False, 6),
+        (False, 1, True, 10),
+    ],
+    ids=[
+        "attention-dcp1",
+        "attention-dcp2",
+        "mamba-unscaled-dcp2",
+        "circular-excluded-dcp1",
+    ],
+)
+@pytest.mark.parametrize("capacity_offset", [-1, 0])
+def test_load_admission_reserves_each_transferred_group_block_size(
+    use_mamba, dcp, include_circular, required_blocks, capacity_offset
+):
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeStoreConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={"max_pending_blocks_ratio": 1.0},
+        block_size=16,
+    )
+    vllm_config.parallel_config = ParallelConfig(
+        tensor_parallel_size=dcp, decode_context_parallel_size=dcp
+    )
+    groups = [
+        make_kv_cache_group(
+            [f"attention{block_size}"],
+            AttentionSpec(
+                block_size=block_size,
+                num_kv_heads=8,
+                head_size=64,
+                dtype=torch.float32,
+            ),
+        )
+        for block_size in (16, 64)
+    ]
+    if use_mamba:
+        groups[1] = make_kv_cache_group(
+            ["mamba64"],
+            mamba_layer(
+                block_size=64,
+                shapes=((1, 1),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            ),
+        )
+    if include_circular:
+        groups.append(
+            make_kv_cache_group(
+                ["circular128"],
+                circular_buffer_layer(
+                    block_size=128,
+                    num_kv_heads=8,
+                    head_size=64,
+                    dtype=torch.float32,
+                ),
+            )
+        )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=required_blocks + capacity_offset,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+    )
+    _, hash_block_size = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+    init_none_hash(sha256)
+    request = Request(
+        "group-capacity",
+        list(range(256)),
+        SamplingParams(max_tokens=1),
+        None,
+        block_hasher=get_request_block_hasher(hash_block_size, sha256),
+    )
+    with patch.object(scheduler, "LookupKeyClient") as lookup:
+        lookup.return_value.lookup.return_value = MooncakeLookupResult(128)
+        connector = mooncake_store_connector.MooncakeStoreConnector(
+            vllm_config, KVConnectorRole.SCHEDULER, kv_cache_config
+        )
+        expected = (0, False) if capacity_offset < 0 else (128, True)
+        assert connector.get_num_new_matched_tokens(request, 0) == expected
 
 
 def test_admission_lookup_retains_completed_result_until_scheduled():

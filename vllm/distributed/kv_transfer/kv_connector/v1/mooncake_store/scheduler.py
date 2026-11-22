@@ -296,8 +296,10 @@ class MooncakeStoreScheduler:
         if need_to_allocate <= 0:
             return 0, False
 
-        load_blocks = cdiv(num_external_hit_tokens, self._block_size) * len(
-            self._store_group_ids
+        assert self._store_coord is not None
+        load_blocks = sum(
+            cdiv(num_external_hit_tokens, group.block_size)
+            for group in self._store_coord.kv_cache_groups
         )
         if (
             self._save_budget.num_blocks
