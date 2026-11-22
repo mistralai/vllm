@@ -591,7 +591,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Retained only after a failed store so retry events can recover the
         # token suffix without full snapshots on the normal path.
         self._retry_token_ids: dict[str, tuple[int, list[int]]] = {}
-        self._dropped_saves: dict[int, str] = {}
 
     def add_request(self, request: ReqMeta) -> None:
         # Register before enqueueing so a job is never picked up unledgered.
@@ -601,15 +600,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 request.store_job_id
             )
         self.store_service.submit_save(request, self.finish_store_job)
-
-    def expire_queued_saves(self) -> None:
-        self.store_service.expire_saves(self.finish_store_job)
-
-    def take_dropped_saves(self) -> dict[int, str]:
-        with self.done_task_lock:
-            dropped = self._dropped_saves
-            self._dropped_saves = {}
-        return dropped
 
     def is_live_store_job(self, req_meta: ReqMeta) -> bool:
         with self.done_task_lock:
@@ -625,9 +615,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._saved_offset.pop(req_id, None)
             self._retry_token_ids.pop(req_id, None)
 
-    def finish_store_job(
-        self, req_meta: ReqMeta, drop_reason: str | None = None
-    ) -> None:
+    def finish_store_job(self, req_meta: ReqMeta) -> None:
         """Retire a job from the ledger and report its blocks as no longer read.
 
         Every path out of a job must reach this, skips and failures included: a
@@ -642,14 +630,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
             live = self.stored_requests.get(req_meta.req_id)
             if live is not None:
                 live.discard(store_job_id)
-            if drop_reason is not None:
-                self._dropped_saves.setdefault(store_job_id, drop_reason)
             self._completed_saves[store_job_id] = (
                 self._completed_saves.get(store_job_id, 0) + 1
             )
 
     def take_completed_saves(self) -> dict[int, int]:
-        self.expire_queued_saves()
         with self.done_task_lock:
             completed = self._completed_saves
             self._completed_saves = {}
@@ -769,15 +754,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     )
         return puts
 
-    def _check_keys_exist(self, req_meta: ReqMeta, keys: list[str]) -> list[int] | None:
-        req_id = req_meta.req_id
+    def _check_keys_exist(self, req_id: str, keys: list[str]) -> list[int] | None:
         start = time.perf_counter()
         try:
             results = self.store_service.check_save_exists(keys)
         except CacheCircuitOpen:
-            assert req_meta.store_job_id is not None
-            with self.done_task_lock:
-                self._dropped_saves[req_meta.store_job_id] = "circuit_breaker"
             return None
         except Exception as e:
             self._record_operation(
@@ -839,7 +820,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if self.enable_group_semantics and self.supports_group_ids
             else None
         )
-        exists = self._check_keys_exist(req_meta, keys)
+        exists = self._check_keys_exist(req_meta.req_id, keys)
         if exists is None:
             return False
         missing = [i for i, e in enumerate(exists) if e != 1]
@@ -911,19 +892,12 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # this job's GPU block references however the job ends.
         self.store_service.start_save()
         save_completed = False
-        drop_reason: str | None = None
         available_token_len = 0
         checkpoint_len = 0
         req_id = req_meta.req_id
         event_token_ids = req_meta.token_ids
         token_ids_start = req_meta.token_ids_start
         try:
-            if (
-                req_meta.save_start_deadline is not None
-                and time.monotonic() >= req_meta.save_start_deadline
-            ):
-                drop_reason = "start_timeout"
-                return
             lcm_block_size = self.coord.lcm_block_size
             available_token_len = req_meta.token_len_chunk
             checkpoint_len = available_token_len // lcm_block_size * lcm_block_size
@@ -1036,7 +1010,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 return
 
             # Check which blocks already exist (dedup)
-            exists_states = self._check_keys_exist(req_meta, keys)
+            exists_states = self._check_keys_exist(req_id, keys)
             if exists_states is None:
                 return
             missing_indices = [
@@ -1253,7 +1227,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     token_ids_start,
                     event_token_ids,
                 )
-            self.finish_store_job(req_meta, drop_reason)
+            self.finish_store_job(req_meta)
             self.request_queue.task_done()
 
 
@@ -1643,8 +1617,6 @@ class MooncakeStoreWorker:
         assert kv_role is not None
         self.kv_role = kv_role
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
-        save_config = MooncakeStoreService.SaveConfig.from_extra_config(extra_config)
-        self._recorded_save_drops: dict[str, int] = {}
         self.save_decode_cache = extra_config.get("save_decode_cache", False)
         self.can_put = (
             self.kv_role in ("kv_producer", "kv_both") or self.save_decode_cache
@@ -1692,7 +1664,7 @@ class MooncakeStoreWorker:
             local_hostname = rdma_utils.get_requester_local_hostname(get_ip())
 
         self.store = MooncakeDistributedStore()
-        self.store_service = MooncakeStoreService(self.store, save_config)
+        self.store_service = MooncakeStoreService(self.store)
         setup_mooncake_store(
             self.store, store_config, local_hostname, engine=shared_engine
         )
@@ -2416,12 +2388,6 @@ class MooncakeStoreWorker:
         if self._capacity_only or not self.can_put:
             return
 
-        if metadata.save_drop_totals and self.lookup_server is not None:
-            with self._kv_connector_stats_lock:
-                self.kv_connector_stats.record_save_drop_totals(
-                    metadata.save_drop_totals, self._recorded_save_drops
-                )
-
         # A request may be re-admitted in the step reporting its preemption.
         assert self.kv_send_thread is not None
         for req_id in metadata.preempted_req_ids:
@@ -2451,8 +2417,6 @@ class MooncakeStoreWorker:
             return set(), set()
 
         if self.can_put:
-            assert self.kv_send_thread is not None
-            self.kv_send_thread.expire_queued_saves()
             self._close_ended_store_requests(finished_req_ids, meta)
 
         # Blocks read by a store job are released by the scheduler when the job
@@ -2563,9 +2527,6 @@ class MooncakeStoreWorker:
             return None
         return MooncakeStoreWorkerMetadata(
             completed_saves=completed_saves,
-            dropped_saves=self.kv_send_thread.take_dropped_saves()
-            if self.kv_send_thread is not None
-            else {},
             read_failures=read_failures,
         )
 
