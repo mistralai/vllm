@@ -80,7 +80,10 @@ class _DictStore:
         return [0] * len(keys)
 
     def batch_get_into_multi_buffers(self, keys, addrs, sizes, *_args, **_kwargs):
-        return [0 if k in self._data else -1 for k in keys]
+        return [
+            sum(buffer_sizes) if key in self._data else -1
+            for key, buffer_sizes in zip(keys, sizes, strict=True)
+        ]
 
 
 def _minimal_vllm_config(cache_block_size=16):
@@ -590,7 +593,7 @@ def test_recv_skips_swa_blocks_before_window():
     class _CapturingStore:
         def batch_get_into_multi_buffers(self, keys, addrs, sizes):
             requested_keys.extend(keys)
-            return [0] * len(keys)
+            return [sum(buffer_sizes) for buffer_sizes in sizes]
 
     ready = threading.Event()
     coord = MooncakeStoreCoordinator(
@@ -1426,7 +1429,7 @@ def test_selective_lease_covers_every_key_the_load_reads(monkeypatch):
     class _CapturingStore:
         def batch_get_into_multi_buffers(self, keys, addrs, sizes):
             read_keys.extend(keys)
-            return [0] * len(keys)
+            return [sum(buffer_sizes) for buffer_sizes in sizes]
 
     recv = KVCacheStoreRecvingThread(
         store_service=MooncakeStoreService(_CapturingStore()),

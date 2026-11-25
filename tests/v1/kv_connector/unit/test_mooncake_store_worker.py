@@ -747,7 +747,9 @@ def test_tp_shared_receiving_reads_each_local_store_shard():
     from vllm.v1.kv_cache_interface import AttentionSpec
 
     store = MagicMock()
-    store.batch_get_into_multi_buffers.return_value = [1, 1, 1, 1]
+    store.batch_get_into_multi_buffers.side_effect = lambda keys, addrs, sizes: [
+        sum(buffer_sizes) for buffer_sizes in sizes
+    ]
     db, _ = _make_tp_shared_db()
     spec = AttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
     coord = mooncake_store_worker.MooncakeStoreCoordinator(
@@ -775,6 +777,7 @@ def test_tp_shared_receiving_reads_each_local_store_shard():
         f"{_tp_shared_prefix(1)}@6831",
     ]
     assert len(addrs) == len(sizes) == 4
+    assert thread.get_and_clear_failed_requests() == set()
 
 
 def test_pool_key_cache_prefix_namespaces_and_disambiguates():
@@ -2852,7 +2855,7 @@ def test_recv_thread_reports_unsplittable_key_larger_than_budget():
 def test_recv_thread_partial_load_failure_reports_block_ids_without_hma():
     store = MagicMock()
     # First key fails, second succeeds.
-    store.batch_get_into_multi_buffers.return_value = [-1, 0]
+    store.batch_get_into_multi_buffers.return_value = [-1, 256]
     thread = _make_store_recving_thread(store)
 
     thread._handle_request(_make_load_req("req-a", [b"h0", b"h1"], token_len=32))
@@ -2864,7 +2867,7 @@ def test_recv_thread_partial_load_failure_reports_block_ids_without_hma():
 
 def test_recv_thread_partial_load_failure_reports_request_with_hma():
     store = MagicMock()
-    store.batch_get_into_multi_buffers.return_value = [-1, 0]
+    store.batch_get_into_multi_buffers.return_value = [-1, 256]
     thread = _make_store_recving_thread(store, is_hma_required=True)
 
     thread._handle_request(_make_load_req("req-a", [b"h0", b"h1"], token_len=32))

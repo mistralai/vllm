@@ -1462,6 +1462,19 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 # Reset so the recorded RPC duration excludes tier lookup.
                 load_get_start = time.perf_counter()
                 res = self.store_service.get(batch_keys, batch_addrs, batch_sizes)
+                for i, (key, returned_bytes, sizes) in enumerate(
+                    zip(batch_keys, res, batch_sizes, strict=True)
+                ):
+                    expected_bytes = sum(sizes)
+                    if returned_bytes >= 0 and returned_bytes != expected_bytes:
+                        logger.warning(
+                            "Mooncake GET byte-count mismatch for %s: "
+                            "expected %d, got %d",
+                            key,
+                            expected_bytes,
+                            returned_bytes,
+                        )
+                        res[i] = -1
                 if tiers_by_key is not None:
                     _log_mooncake_load_tier_summary(
                         req_id, batch_keys, res, tiers_by_key
