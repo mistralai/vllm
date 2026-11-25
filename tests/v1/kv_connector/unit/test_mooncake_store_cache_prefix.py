@@ -8,16 +8,19 @@ import pytest
 from transformers import OPTConfig
 
 from vllm.config import (
+    AttentionConfig,
     CacheConfig,
     DeviceConfig,
     KVTransferConfig,
     ModelConfig,
     SchedulerConfig,
+    SpeculativeConfig,
     VllmConfig,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.worker import (
     _resolve_cache_prefix,
 )
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 pytestmark = pytest.mark.cpu_test
 
@@ -92,6 +95,78 @@ def test_model_or_kv_format_change_isolates(model_path: Path) -> None:
     assert _resolve_cache_prefix(make_config(model_path, dtype="bfloat16")) != base
     fp8_kv = make_config(model_path, cache_config=CacheConfig(cache_dtype="fp8"))
     assert _resolve_cache_prefix(fp8_kv) != base
+
+
+@pytest.mark.parametrize(
+    "attention_kwargs",
+    [
+        {"backend": AttentionBackendEnum.FLASH_ATTN},
+        {"flash_attn_version": 3},
+    ],
+)
+def test_attention_change_isolates(
+    model_path: Path, attention_kwargs: dict[str, Any]
+) -> None:
+    base = _resolve_cache_prefix(make_config(model_path))
+    config = make_config(
+        model_path, attention_config=AttentionConfig(**attention_kwargs)
+    )
+    assert _resolve_cache_prefix(config) != base
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2])
+def test_speculation_change_isolates(
+    model_path: Path, num_speculative_tokens: int
+) -> None:
+    base = _resolve_cache_prefix(make_config(model_path))
+    config = make_config(
+        model_path,
+        speculative_config=SpeculativeConfig(
+            method="ngram", num_speculative_tokens=num_speculative_tokens
+        ),
+    )
+    assert _resolve_cache_prefix(config) != base
+    other = make_config(
+        model_path,
+        speculative_config=SpeculativeConfig(
+            method="ngram", num_speculative_tokens=num_speculative_tokens + 1
+        ),
+    )
+    assert _resolve_cache_prefix(other) != _resolve_cache_prefix(config)
+
+
+@pytest.mark.parametrize(
+    "draft_kwargs",
+    [
+        {"revision": "different-revision"},
+        {"code_revision": "different-code-revision"},
+        {"attention_backend": AttentionBackendEnum.FLASH_ATTN},
+        {"num_speculative_tokens": 2},
+        {"disable_lookahead_block_hashes": True},
+    ],
+)
+def test_draft_configuration_change_isolates(
+    model_path: Path, draft_kwargs: dict[str, Any]
+) -> None:
+    def config(**overrides: Any) -> VllmConfig:
+        target = make_config(model_path)
+        return make_config(
+            model_path,
+            speculative_config=SpeculativeConfig(
+                **{
+                    "method": "draft_model",
+                    "model": str(model_path),
+                    "num_speculative_tokens": 1,
+                    "target_model_config": target.model_config,
+                    "target_parallel_config": target.parallel_config,
+                    **overrides,
+                }
+            ),
+        )
+
+    base = _resolve_cache_prefix(config())
+    assert _resolve_cache_prefix(config()) == base
+    assert _resolve_cache_prefix(config(**draft_kwargs)) != base
 
 
 @pytest.mark.parametrize("image_tag", ["", "local/vllm-openai:dev"])

@@ -394,13 +394,20 @@ reset waits at most 60 seconds.
 
 Set `"cache_prefix": "auto"` in `kv_connector_extra_config` to derive the prefix
 from the deployment identity: `VLLM_IMAGE_TAG` (or `VLLM_BUILD_COMMIT`), the
-model configuration (path, revision, dtype, quantization) and the KV cache
-configuration (e.g. KV dtype, block size). Changing any of these isolates new
+model configuration (path, revision, dtype, quantization), the KV cache
+configuration (e.g. KV dtype, block size), attention configuration and
+speculative-decoding configuration (including draft model identity/revision,
+draft configuration and speculative-token count). Changing any of these isolates new
 blocks from previously cached ones; identically configured replicas share the
 prefix. Official release images set both build identity variables; custom builds
 must pass `--build-arg VLLM_IMAGE_TAG=<immutable-tag>`, otherwise startup fails.
 Environment flags and weight files are not hashed: use a custom prefix if they
 change while the image and model configuration stay the same.
+
+Attention and speculation settings are isolated conservatively, even when two
+recipes may produce compatible KV. Upgrading to this fingerprint invalidates
+previous automatic namespaces, so the external cache starts cold. Custom literal
+prefixes are unchanged; their compatibility remains the operator's responsibility.
 
 LBHNC/HND is strongly recommended for TP-sharded Store when supported. LBNHC/NHD
 creates many transfer segments and may significantly reduce PUT/GET performance.
