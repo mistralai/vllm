@@ -28,8 +28,8 @@ import torch
 import zmq
 
 import vllm.envs as envs
-from vllm.config import ModelConfig, VllmConfig
-from vllm.config.utils import hash_config, hash_factors
+from vllm.config import ModelConfig, SpeculativeConfig, VllmConfig
+from vllm.config.utils import get_compile_factors, hash_config, hash_factors
 from vllm.distributed import (
     get_dcp_group,
     get_pcp_group,
@@ -219,11 +219,31 @@ def _replicate_config_supports_group_ids(
     return hasattr(replicate_config, "group_ids")
 
 
+def _spec_config_hash(speculative_config: SpeculativeConfig) -> str:
+    # Compile hashes omit draft identity and speculation settings. Exclude
+    # deployment ranks and loading options, but retain resolved draft state.
+    factors = get_compile_factors(
+        speculative_config,
+        {
+            "target_model_config",
+            "target_parallel_config",
+            "draft_parallel_config",
+            "draft_load_config",
+        },
+    )
+    draft_model_config = speculative_config.draft_model_config
+    if draft_model_config is not None:
+        factors["draft_hf_commit"] = getattr(
+            draft_model_config.hf_config, "_commit_hash", None
+        )
+    return hash_factors(factors)
+
+
 def _resolve_cache_prefix(vllm_config: VllmConfig) -> str:
     """Return the configured cache_prefix, deriving one for "auto".
 
-    "auto" namespaces keys by build and model identity, so a new image or
-    model revision does not read KV written by a different deployment.
+    "auto" namespaces keys by build, model, attention and speculative config
+    so recipe changes do not reuse KV from a different deployment.
     Ranks and Store payload format are already part of the key.
     """
     assert vllm_config.kv_transfer_config is not None
@@ -243,12 +263,19 @@ def _resolve_cache_prefix(vllm_config: VllmConfig) -> str:
             "VLLM_BUILD_COMMIT to identify the deployed code."
         )
     model_config = vllm_config.model_config
+    speculative_config = vllm_config.speculative_config
     prefix = "auto-" + hash_factors(
         {
             "build": build,
             "model": hash_config(model_config),
             "hf_commit": getattr(model_config.hf_config, "_commit_hash", None),
             "cache": hash_config(vllm_config.cache_config),
+            "attention": hash_config(vllm_config.attention_config),
+            "speculative": (
+                _spec_config_hash(speculative_config)
+                if speculative_config is not None
+                else None
+            ),
         }
     )
     logger.info("MooncakeStore resolved cache_prefix: %s", prefix)
