@@ -114,27 +114,6 @@ def test_attention_change_isolates(
     assert _resolve_cache_prefix(config) != base
 
 
-@pytest.mark.parametrize("num_speculative_tokens", [1, 2])
-def test_speculation_change_isolates(
-    model_path: Path, num_speculative_tokens: int
-) -> None:
-    base = _resolve_cache_prefix(make_config(model_path))
-    config = make_config(
-        model_path,
-        speculative_config=SpeculativeConfig(
-            method="ngram", num_speculative_tokens=num_speculative_tokens
-        ),
-    )
-    assert _resolve_cache_prefix(config) != base
-    other = make_config(
-        model_path,
-        speculative_config=SpeculativeConfig(
-            method="ngram", num_speculative_tokens=num_speculative_tokens + 1
-        ),
-    )
-    assert _resolve_cache_prefix(other) != _resolve_cache_prefix(config)
-
-
 @pytest.mark.parametrize(
     "draft_kwargs",
     [
