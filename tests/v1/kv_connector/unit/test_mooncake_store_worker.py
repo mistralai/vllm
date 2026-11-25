@@ -2777,6 +2777,29 @@ def test_recv_thread_stops_after_first_failing_disk_offload_sub_batch():
     assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1, 2}
 
 
+@pytest.mark.parametrize("returned_bytes", [0, 255, 256, 257])
+@pytest.mark.parametrize("is_hma_required", [False, True])
+def test_recv_thread_requires_exact_get_byte_count(
+    returned_bytes: int, is_hma_required: bool
+) -> None:
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.side_effect = [[256, returned_bytes], [256]]
+    thread = _make_store_recving_thread(
+        store,
+        disk_offload_buffer_budget_bytes=_DISK_OFFLOAD_BUDGET_FOR_SPLIT,
+        is_hma_required=is_hma_required,
+    )
+    thread._handle_request(_make_load_req("req-a", [b"a0", b"a1", b"a2"], token_len=48))
+
+    failed = returned_bytes != 256
+    assert store.batch_get_into_multi_buffers.call_count == (1 if failed else 2)
+    assert thread.get_and_clear_finished_requests() == {"req-a"}
+    assert thread.get_and_clear_failed_requests() == ({"req-a"} if failed else set())
+    assert thread.get_and_clear_block_ids_with_load_errors() == (
+        {1, 2} if failed and not is_hma_required else set()
+    )
+
+
 def test_recv_thread_skips_split_when_budget_holds_all_keys():
     """PR-36 removed the count-based split trigger; with budget for 3 keys,
     all three should be requested in a single call."""
